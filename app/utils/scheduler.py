@@ -1074,6 +1074,15 @@ async def _execute_daily_pipeline() -> dict:
 def _run_daily_pipeline():
     """schedule 라이브러리에서 호출되는 진입점"""
     pipeline_logger = logging.getLogger('daily_pipeline')
+
+    # 주말 가드: 미국 장 기준 토(5)/일(6) 에는 자동 파이프라인 스킵
+    # (데이터 수집 + LLM 매수/홀드 판단 전체를 건너뜀)
+    # 수동 트리거 POST /pipeline/run-full-daily 는 _execute_daily_pipeline 을 직접 호출하므로 영향 없음
+    ny_weekday = datetime.now(pytz.timezone('America/New_York')).weekday()
+    if ny_weekday >= 5:
+        pipeline_logger.info(f"주말(뉴욕 기준 weekday={ny_weekday}) — 일일 파이프라인 스킵")
+        return True
+
     try:
         result = asyncio.run(_execute_daily_pipeline())
         if not result["success"]:
