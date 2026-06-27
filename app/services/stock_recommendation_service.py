@@ -1,5 +1,7 @@
 import pandas as pd
 import requests
+import csv
+import io
 import time
 import pytz
 from datetime import datetime, timedelta
@@ -575,6 +577,172 @@ class StockRecommendationService:
             "results": results
         }
 
+    def preview_earnings_calendar(self):
+        """
+        Alpha Vantage EARNINGS_CALENDAR를 1회 벌크 호출하여, 우리 유니버스(추천 종목 + 보유 종목)에
+        해당하는 향후 실적 발표 일정만 필터링해 반환합니다. (DB 저장 안 함)
+
+        ⚠️ 이 엔드포인트의 응답은 JSON이 아니라 CSV입니다.
+        ⚠️ symbol 파라미터 없이 호출하면 전체 시장 일정(수천 건)이 한 번에 오므로, 종목당 호출하지 않습니다.
+        반환: [{ticker, company_name, report_date, fiscal_date_ending, eps_estimate, currency, time_of_day}, ...]
+        """
+        api_key = settings.ALPHA_VANTAGE_API_KEY_EARNINGS
+        if not api_key:
+            print("  ALPHA_VANTAGE_API_KEY_EARNINGS 미설정 - 실적 캘린더 수집 건너뜀")
+            return []
+
+        # 1. 유니버스 구성: 추천 대상 티커 + 현재 보유 티커
+        universe = set(STOCK_TO_TICKER.values())
+        try:
+            balance_result = get_all_overseas_balances()
+            if balance_result.get("rt_cd") == "0":
+                for item in balance_result.get("output1", []):
+                    t = item.get("ovrs_pdno")
+                    if t:
+                        universe.add(t)
+        except Exception as e:
+            print(f"  실적 캘린더용 보유종목 조회 실패(무시): {e}")
+
+        # 2. 벌크 1회 호출 (symbol 없음 → 전체 시장, horizon=6month)
+        base_url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "EARNINGS_CALENDAR",
+            "horizon": "6month",
+            "apikey": api_key,
+        }
+        try:
+            response = requests.get(base_url, params=params)
+        except Exception as e:
+            print(f"  실적 캘린더 API 호출 예외: {e}")
+            return []
+
+        if response.status_code != 200:
+            print(f"  실적 캘린더 API 호출 실패: status={response.status_code}")
+            return []
+
+        # 3. CSV 파싱 (rate-limit/키 오류 시 CSV 대신 JSON 안내문이 올 수 있음)
+        reader = csv.DictReader(io.StringIO(response.text))
+        if not reader.fieldnames or "symbol" not in reader.fieldnames:
+            print(f"  실적 캘린더 응답 이상(아마 rate-limit/키 오류): {response.text[:200]}")
+            return []
+
+        # 4. 우리 유니버스로 필터링 + 매핑
+        results = []
+        for row in reader:
+            symbol = (row.get("symbol") or "").strip()
+            if symbol not in universe:
+                continue
+
+            report_date = (row.get("reportDate") or "").strip()
+            if not report_date:
+                continue
+
+            estimate_raw = (row.get("estimate") or "").strip()
+            try:
+                eps_estimate = round(float(estimate_raw), 2) if estimate_raw else None
+            except ValueError:
+                eps_estimate = None
+
+            results.append({
+                "ticker": symbol,
+                "company_name": (row.get("name") or "").strip() or None,
+                "report_date": report_date,
+                "fiscal_date_ending": (row.get("fiscalDateEnding") or "").strip() or None,
+                "eps_estimate": eps_estimate,
+                "currency": (row.get("currency") or "").strip() or None,
+                "time_of_day": (row.get("timeOfTheDay") or "").strip() or None,
+            })
+
+        # 5. AV 캘린더에 없는 종목은 Finnhub로 보강
+        #    (예: MU/COST/AVGO — Alpha Vantage 무료 피드에 향후 실적일이 미수록.
+        #     MU는 핵심 종목이라 실적 리스크 정보가 비면 안 됨. yfinance는 429 빈발 → Finnhub 사용)
+        ETF_TICKERS = {"SPY", "QQQ"}  # 실적 없음 → 보강 스킵
+        covered = {r["ticker"] for r in results}
+        missing = [t for t in universe if t not in covered and t not in ETF_TICKERS]
+        finnhub_key = settings.FINNHUB_API_KEY
+        if missing and not finnhub_key:
+            print(f"  FINNHUB_API_KEY 미설정 - 보강 스킵 (미수록: {missing})")
+        elif missing:
+            today_ny = datetime.now(pytz.timezone('America/New_York')).date()
+            to_date = (today_ny + timedelta(days=180)).isoformat()
+            # Finnhub 'hour' → time_of_day 매핑 (bmo=장전, amc=장마감후, dmh=장중)
+            hour_map = {"bmo": "pre-market", "amc": "post-market", "dmh": "during-market"}
+            for idx, t in enumerate(missing):
+                if idx > 0:
+                    time.sleep(1.0)  # Finnhub 무료 분당 60회 — 여유롭지만 예의상 간격
+                try:
+                    fr = requests.get(
+                        "https://finnhub.io/api/v1/calendar/earnings",
+                        params={"from": today_ny.isoformat(), "to": to_date, "symbol": t, "token": finnhub_key},
+                        timeout=15,
+                    )
+                    if fr.status_code != 200:
+                        print(f"  [Finnhub 보강 실패] {t}: status={fr.status_code} {fr.text[:100]}")
+                        continue
+                    ec = fr.json().get("earningsCalendar", []) or []
+                    # 가장 가까운 미래 발표일
+                    future = sorted(
+                        (e for e in ec if e.get("date") and e["date"] >= today_ny.isoformat()),
+                        key=lambda e: e["date"],
+                    )
+                    if not future:
+                        continue
+                    e0 = future[0]
+                    eps_est = e0.get("epsEstimate")
+                    try:
+                        eps_est = round(float(eps_est), 2) if eps_est is not None else None
+                    except (ValueError, TypeError):
+                        eps_est = None
+                    results.append({
+                        "ticker": t,
+                        "company_name": None,
+                        "report_date": e0["date"],
+                        "fiscal_date_ending": None,
+                        "eps_estimate": eps_est,
+                        "currency": "USD",
+                        "time_of_day": hour_map.get(e0.get("hour"), None),
+                    })
+                    print(f"  [Finnhub 보강] {t} 실적일 {e0['date']} (예상 EPS {eps_est})")
+                except Exception as fe:
+                    print(f"  [Finnhub 보강 실패] {t}: {fe}")
+
+        print(f"  실적 캘린더 필터 완료: 우리 유니버스 {len(results)}건 (AV + Finnhub 보강 포함)")
+        return results
+
+    def fetch_and_store_earnings_calendar(self):
+        """
+        preview_earnings_calendar() 결과를 earnings_calendar 테이블에 저장합니다 (전체 삭제 후 삽입).
+        best-effort: 어떤 단계든 실패해도 예외를 던지지 않고 count=0으로 반환합니다.
+        """
+        try:
+            rows = self.preview_earnings_calendar()
+            if not rows:
+                return {"message": "저장할 실적 일정이 없습니다", "count": 0, "results": []}
+
+            # 중복 (ticker, report_date) 제거 (unique 제약 대비)
+            seen = set()
+            to_insert = []
+            for r in rows:
+                key = (r["ticker"], r["report_date"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                to_insert.append(r)
+
+            # 기존 데이터 전체 삭제 후 삽입 (감성분석 테이블과 동일 패턴)
+            supabase.table("earnings_calendar").delete().gte("ticker", "").execute()
+            supabase.table("earnings_calendar").insert(to_insert).execute()
+
+            print(f"  실적 캘린더 저장 완료: {len(to_insert)}건")
+            return {
+                "message": f"{len(to_insert)}개 실적 일정 저장",
+                "count": len(to_insert),
+                "results": to_insert,
+            }
+        except Exception as e:
+            print(f"  실적 캘린더 수집/저장 실패: {e}")
+            return {"message": f"실적 수집 실패: {e}", "count": 0, "results": []}
+
     def get_combined_recommendations_with_technical_and_sentiment(self):
         """
         ML 예측 + 기술적 지표 + 감성분석 + 시장환경을 통합하여 매수 추천 목록을 반환합니다.
@@ -613,7 +781,21 @@ class StockRecommendationService:
                     return v
             tech_map = {row["종목"]: {k: _safe_value(v) for k, v in row.to_dict().items()} for _, row in tech_df.iterrows()}
             sentiment_map = {item["ticker"]: item for item in sentiment_response.data} if sentiment_response.data else {}
-            
+
+            # 4-1. 실적 캘린더 조회: 티커별 '가장 가까운 미래 발표일' 1건
+            ny_today = datetime.now(pytz.timezone('America/New_York')).date()
+            earnings_map = {}
+            try:
+                earnings_response = supabase.table("earnings_calendar").select("*").gte(
+                    "report_date", ny_today.isoformat()
+                ).order("report_date", desc=False).execute()
+                for row in (earnings_response.data or []):
+                    t = row["ticker"]
+                    if t not in earnings_map:  # report_date 오름차순이라 첫 등장이 가장 가까운 미래
+                        earnings_map[t] = row
+            except Exception as e:
+                print(f"  실적 캘린더 조회 실패(무시): {e}")
+
             # 5. 결과 통합 (거래량은 DB에서 읽기)
             results = []
             for rec in recommendations:
@@ -627,6 +809,18 @@ class StockRecommendationService:
                     continue  # 기술적 지표가 없으면 제외
 
                 sentiment = sentiment_map.get(ticker)
+
+                # 실적 발표 정보 (가장 가까운 미래 발표일 + D-day + 예상 EPS)
+                earnings = earnings_map.get(ticker)
+                earnings_date = earnings["report_date"] if earnings else None
+                earnings_estimate = earnings.get("eps_estimate") if earnings else None
+                days_to_earnings = None
+                if earnings_date:
+                    try:
+                        _ed = datetime.strptime(earnings_date, "%Y-%m-%d").date()
+                        days_to_earnings = (_ed - ny_today).days
+                    except (ValueError, TypeError):
+                        days_to_earnings = None
 
                 # 거래량 비율 + ADX는 DB에서 읽기 (generate_technical_recommendations에서 저장됨)
                 volume_ratio = tech_data.get("volume_ratio")
@@ -660,6 +854,9 @@ class StockRecommendationService:
                     "technical_recommended": bool(tech_data["추천_여부"]),
                     "volume_ratio": volume_ratio,
                     "adx": adx_value,
+                    "earnings_date": earnings_date,
+                    "earnings_estimate": earnings_estimate,
+                    "days_to_earnings": days_to_earnings,
                 }
                 results.append(combined_data)
             

@@ -1023,6 +1023,10 @@ async def _execute_daily_pipeline() -> dict:
     try:
         service = StockRecommendationService()
         service.generate_technical_recommendations()
+        try:
+            service.fetch_and_store_earnings_calendar()   # 전용 키, 1회 호출, best-effort
+        except Exception as e:
+            pipeline_logger.warning(f"실적 캘린더 수집 실패(무시): {e}")
         service.fetch_and_store_sentiment_for_recommendations()
         elapsed = int(time.time() - step_start)
         completed_steps[step_key] = {"step_name": step_name, "elapsed_sec": elapsed}

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
 
     SUPABASE_URL: str = os.getenv("SUPABASE_URL")
     SUPABASE_KEY: str = os.getenv("SUPABASE_KEY")
+    # service_role 키 (RLS 우회) — 서버 백엔드 전용, 절대 외부 노출 금지.
+    # 설정돼 있으면 Supabase 클라이언트가 이 키를 우선 사용 (RLS ON 환경에서 서버 쓰기 보장)
+    SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
     # 한국투자증권 API 설정
     KIS_USE_MOCK: bool = Field(default=True, description="모의투자 사용 여부")
@@ -49,6 +52,10 @@ class Settings(BaseSettings):
     KIS_ACNT_PRDT_CD: str = Field(default="01", description="계좌번호 뒤 2자리")
 
     ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+    # 실적 캘린더(EARNINGS_CALENDAR) 전용 키 — 감성분석 키와 분리하여 일일 호출 한도 충돌 방지
+    ALPHA_VANTAGE_API_KEY_EARNINGS: str = os.getenv("ALPHA_VANTAGE_API_KEY_EARNINGS", "")
+    # Finnhub — Alpha Vantage 캘린더에 없는 종목(MU/COST/AVGO 등)의 실적일 보강용 (yfinance 429 대체)
+    FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     TR_ID: str = os.getenv("TR_ID")
 

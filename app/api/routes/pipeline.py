@@ -87,6 +87,21 @@ async def run_buy_pipeline():
         }
 
         # ──────────────────────────────────────────────────
+        # Step 1.5: 실적 캘린더 수집 (전용 키, 1회 호출, best-effort)
+        #   수동 실행 시에도 옛 DB 값이 아닌 그 시점 실적을 LLM에 반영하기 위함
+        # ──────────────────────────────────────────────────
+        try:
+            earnings_result = service.fetch_and_store_earnings_calendar()
+            logger.info(f"[1.5] 실적 캘린더 수집: {earnings_result.get('message', '')}")
+            steps_summary["1.5_earnings_calendar"] = {
+                "message": earnings_result.get("message", ""),
+                "count": earnings_result.get("count", 0),
+            }
+        except Exception as e:
+            logger.warning(f"[1.5] 실적 캘린더 수집 실패(무시): {e}")
+            steps_summary["1.5_earnings_calendar"] = {"message": f"실패(무시): {e}", "count": 0}
+
+        # ──────────────────────────────────────────────────
         # Step 2: 뉴스 감성 분석
         # ──────────────────────────────────────────────────
         logger.info("[2/4] 뉴스 감성 분석 시작")
@@ -187,6 +202,43 @@ async def run_buy_pipeline():
             status_code=500,
             detail=f"통합 파이프라인 중 오류 발생: {str(e)}",
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# 실적 캘린더 (documents/17_실적캘린더_연동_기획.md)
+# ══════════════════════════════════════════════════════════════════
+
+@router.get(
+    "/earnings/preview",
+    response_model=dict,
+    summary="실적 캘린더 미리보기 (DB 저장 안 함)",
+)
+async def earnings_preview():
+    """
+    ALPHA_VANTAGE_API_KEY_EARNINGS 로 EARNINGS_CALENDAR 를 1회 호출하여
+    우리 유니버스(추천 종목 + 보유 종목)로 필터링한 결과만 반환합니다. **DB 미저장**.
+
+    키/응답/필터 동작을 안전하게 점검하기 위한 용도.
+    - 키가 없거나 rate-limit 이면 예외 없이 count=0 으로 반환.
+    """
+    service = StockRecommendationService()
+    rows = await asyncio.to_thread(service.preview_earnings_calendar)
+    return {"count": len(rows), "results": rows}
+
+
+@router.post(
+    "/earnings/fetch",
+    response_model=dict,
+    summary="실적 캘린더 수집 + earnings_calendar 테이블 저장",
+)
+async def earnings_fetch():
+    """
+    fetch_and_store_earnings_calendar() 를 실행하여 earnings_calendar 테이블을 갱신합니다 (실제 DB 저장).
+    전체 삭제 후 삽입 방식. best-effort 라 실패해도 500 대신 count=0 으로 반환.
+    """
+    service = StockRecommendationService()
+    result = await asyncio.to_thread(service.fetch_and_store_earnings_calendar)
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════

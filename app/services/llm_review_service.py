@@ -33,6 +33,9 @@ def _save_llm_decision_logs(candidates: list, decision_map: dict, market_analysi
                 "rsi": candidate.get("rsi"),
                 "adx": candidate.get("adx"),
                 "vix_value": vix_value,
+                "earnings_date": candidate.get("earnings_date"),
+                "days_to_earnings": candidate.get("days_to_earnings"),
+                "earnings_estimate": candidate.get("earnings_estimate"),
                 "updated_at": datetime.now().isoformat(),
             }, on_conflict="decision_date,ticker").execute()
         print(f"  LLM 판단 로그 저장 완료: {len(candidates)}건")
@@ -84,6 +87,14 @@ def review_buy_candidates(candidates: list, vix_value: float = None) -> dict:
     # 매수 후보 데이터를 프롬프트용으로 정리
     stock_summaries = []
     for i, c in enumerate(candidates, 1):
+        # 실적 발표 정보 (작업 5에서 candidate에 결합됨)
+        days_e = c.get('days_to_earnings')
+        if days_e is not None:
+            est = c.get('earnings_estimate')
+            est_str = f"${est}" if est is not None else "N/A"
+            earnings_info = f"{c.get('earnings_date')} (D-{days_e}), 예상 EPS {est_str}"
+        else:
+            earnings_info = "6개월 내 예정 없음(ETF/데이터 미수집)"
         summary = f"""
 {i}. {c.get('stock_name', 'N/A')} ({c.get('ticker', 'N/A')})
    - ML 예측: 예측 상승률 +{c.get('rise_probability', 0):.2f}% (현재가 ${c.get('last_price', 0):.2f} → 예측가 ${c.get('predicted_price', 0):.2f})
@@ -94,6 +105,7 @@ def review_buy_candidates(candidates: list, vix_value: float = None) -> dict:
    - 거래량: 5일 평균 대비 {c.get('volume_ratio', 'N/A')}배
    - ADX(추세강도): {c.get('adx', 'N/A')} {'(강한 추세)' if c.get('adx') and c.get('adx') > 25 else '(추세 약함)' if c.get('adx') and c.get('adx') < 20 else '(보통)'}
    - 감성분석: {c.get('sentiment_score', 'N/A')} (기사 {c.get('article_count', 0)}개)
+   - 실적 발표: {earnings_info}
    - 종합점수: {c.get('composite_score', 0):.4f}
      (예측상승률: {c.get('rise_score', 0)}, 기술: {c.get('tech_score', 0)}, 거래량: {c.get('volume_score', 0)}, ADX: {c.get('adx_score', 0)}, VIX: {c.get('vix_score', 0)})"""
         stock_summaries.append(summary)
@@ -126,7 +138,7 @@ def review_buy_candidates(candidates: list, vix_value: float = None) -> dict:
 - RSI 과매수(> 70)인 종목이 매수 후보에 포함되었다면 시스템 오류 가능성 → HOLD
 
 ### 외부 리스크 확인
-- 해당 종목의 실적 발표(Earnings)가 1주일 이내에 예정 → HOLD
+- 각 종목에는 실제 실적 발표일(D-day)과 예상 EPS가 함께 제공됩니다. 실적 발표 임박은 큰 변동성(어닝 쇼크) 리스크이니, 발표가 가까울수록(예: D-5 이내) 신중하게 종합 판단에 반영하세요. (자동 HOLD 강제는 아니며, 다른 지표가 매우 강하면 매수할 수 있습니다.)
 - FOMC, CPI 등 주요 매크로 이벤트가 1~2일 내 → HOLD 고려
 - 해당 종목의 특이 리스크(CEO 교체, 소송, 규제 등) → HOLD
 

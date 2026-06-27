@@ -1,5 +1,8 @@
 # 환경 변수 (API 키, 시크릿)
 .env
+.env.lecture
+deploy.sh
+status.sh
 
 # Kaggle 인증 + push 시 secrets 자동 주입되는 노트북 (절대 commit 금지)
 .kaggle/
@@ -26,6 +29,8 @@ __pycache__/
 
 # ML 모델
 saved_models/
+kaggle_notebook/predict.ipynb
+predict_colab.py
 
 # IDE
 .vscode/
