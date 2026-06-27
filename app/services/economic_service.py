@@ -82,29 +82,36 @@ async def update_economic_data_in_background(force: bool = False):
     try:
         print("경제 지표 및 주가 데이터 업데이트 작업 시작...")
 
-        # 미국 장 마감 여부 확인 (서머타임 여부와 관계없이 22:30~06:00는 미국 장 시간으로 처리)
-        now = datetime.now()
-        korea_time = now.strftime('%H:%M')
-        current_hour = int(korea_time.split(':')[0])
-        current_min = int(korea_time.split(':')[1])
+        # 미국 장중 여부 확인 (NY 시각 기준 → 주말·서머타임 자동 처리)
+        #   - 미국 정규장: 평일(월~금) 09:30~16:00 ET
+        #   - 주말(토/일)은 휴장 → 장중이 아니므로 수집 진행 (직전 금요일까지 미수집분 수집)
+        #   ★ 기존엔 KST 22:30~06:00 시각만 봐서 주말 밤도 '장중'으로 오판 → 주말 수집이 누락됐음
+        now_kst = datetime.now(pytz.timezone('Asia/Seoul'))
+        now_ny = datetime.now(pytz.timezone('America/New_York'))
+        korea_time = now_kst.strftime('%H:%M')
+        ny_weekday = now_ny.weekday()  # 0=월 ... 4=금, 5=토, 6=일
+        is_weekend = ny_weekday >= 5
 
-        # 미국 장 시간인지 확인 (22:30~06:00)
-        is_market_hours = False
+        is_market_hours = (
+            not is_weekend
+            and (
+                (now_ny.hour == 9 and now_ny.minute >= 30)
+                or (10 <= now_ny.hour < 16)
+                or (now_ny.hour == 16 and now_ny.minute == 0)
+            )
+        )
 
-        # 22:30 이후
-        if current_hour >= 22 and (current_hour > 22 or current_min >= 30):
-            is_market_hours = True
-        # 다음 날 06:00 이전
-        elif current_hour < 6:
-            is_market_hours = True
+        # 주말 안내 (휴장이라 새 데이터는 없지만, 미수집분이 있으면 수집됨)
+        if is_weekend:
+            print(f"현재 미국 시장 휴장(주말, NY {now_ny.strftime('%a %H:%M')}) — 장중 연기 없이 미수집분만 수집합니다.")
 
-        # 미국 주식 시장이 열려 있는 경우, 데이터 수집 연기 (force=True이면 무시)
+        # 미국 정규장이 열려 있는 경우, 데이터 수집 연기 (force=True이면 무시)
         if is_market_hours and not force:
-            print(f"현재 시간 {korea_time}은 미국 주식 시장 운영 시간입니다. 장 마감 후에 데이터를 수집합니다.")
+            print(f"현재 시간 {korea_time}(KST)은 미국 정규장 운영 시간입니다. 장 마감 후에 데이터를 수집합니다.")
             return
 
         if force and is_market_hours:
-            print(f"현재 시간 {korea_time}은 장 중이지만, 강제 수집 모드로 실행합니다.")
+            print(f"현재 시간 {korea_time}(KST)은 장 중이지만, 강제 수집 모드로 실행합니다.")
 
         # 마지막 수집 날짜 조회
         start_date = get_last_updated_date()
