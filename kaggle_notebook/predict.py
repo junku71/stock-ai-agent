@@ -51,21 +51,33 @@ def check_environment():
 # Supabase 연결 (Kaggle Secrets 에서 로드)
 # ============================================================
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# RLS(Row Level Security) ON 환경에서는 service_role 키로 읽어야 데이터가 보인다.
+# 우선순위: SUPABASE_SERVICE_ROLE_KEY → SUPABASE_KEY (환경변수)
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY")
 
 # Kaggle Secrets API 폴백 (UserSecretsClient)
+#   ⚠️ API push 로 만든 커널에서는 "Connection error" 로 실패할 수 있음(Kaggle 플랫폼 이슈).
+#   평소엔 위 환경변수(주입)로 들어오고, Kaggle 이 고치면 이 Secret 폴백이 자동 활성화됨.
 if not SUPABASE_URL or not SUPABASE_KEY:
     try:
         from kaggle_secrets import UserSecretsClient
         user_secrets = UserSecretsClient()
-        SUPABASE_URL = SUPABASE_URL or user_secrets.get_secret("SUPABASE_URL")
-        SUPABASE_KEY = SUPABASE_KEY or user_secrets.get_secret("SUPABASE_KEY")
+        if not SUPABASE_URL:
+            SUPABASE_URL = user_secrets.get_secret("SUPABASE_URL")
+        if not SUPABASE_KEY:
+            for _name in ("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY"):
+                try:
+                    SUPABASE_KEY = user_secrets.get_secret(_name)
+                    if SUPABASE_KEY:
+                        break
+                except Exception:
+                    continue
     except Exception as e:
         print(f"  UserSecretsClient 로드 실패: {e}")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError(
-        "SUPABASE_URL / SUPABASE_KEY 환경변수가 설정되지 않았습니다. "
+        "SUPABASE_URL / SUPABASE_(SERVICE_ROLE_)KEY 환경변수가 설정되지 않았습니다. "
         "Kaggle 노트북의 Add-ons → Secrets 에 등록하세요."
     )
 

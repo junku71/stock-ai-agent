@@ -160,7 +160,8 @@ def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
         code = f.read()
 
     # 첫 셀: secrets 를 os.environ 에 주입 (predict.py 가 os.environ.get 으로 읽음)
-    #   SUPABASE_KEY 자리에 service_role 키를 넣어 RLS 를 우회한다.
+    #   SUPABASE_SERVICE_ROLE_KEY + SUPABASE_KEY 둘 다 service_role 값으로 주입한다.
+    #   (predict.py 가 둘 중 어느 이름으로 읽어도 동작 → 호환/안전)
     secret_cell = {
         "cell_type": "code",
         "execution_count": None,
@@ -170,6 +171,7 @@ def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
             "# AUTO-INJECTED by ml_trigger_service. Do NOT edit / do NOT commit.\n",
             "import os\n",
             f"os.environ['SUPABASE_URL'] = {settings.SUPABASE_URL!r}\n",
+            f"os.environ['SUPABASE_SERVICE_ROLE_KEY'] = {supa_key!r}\n",
             f"os.environ['SUPABASE_KEY'] = {supa_key!r}\n",
         ],
     }
