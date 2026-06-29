@@ -145,9 +145,10 @@ def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
 
     결과 ipynb 는 secrets 가 들어있으므로 .gitignore 필수.
     """
-    # ★ RLS(Row Level Security) ON 환경에서는 anon 키로 읽으면 모든 행이 0건이 된다.
-    #   노트북도 service_role 키를 써야 economic_and_stock_data 를 읽고 예측 결과를 쓸 수 있다.
-    #   (없으면 anon 키로 폴백 — RLS OFF 환경 호환)
+    # ★ Kaggle Secrets(user_secrets)는 API push 로 만든 kernel 에서 "Connection error" 로 실패한다(실측 확인).
+    #   따라서 SUPABASE_URL/KEY 를 노트북 첫 셀에 직접 주입한다.
+    #   RLS(Row Level Security) ON 환경에서는 anon 키면 0행이 되므로 service_role 키를 주입한다.
+    #   (service_role 키 없으면 anon 폴백 — RLS OFF 환경 호환)
     supa_key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY
     if not settings.SUPABASE_URL or not supa_key:
         raise RuntimeError(
