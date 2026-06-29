@@ -19,6 +19,7 @@ Secrets 주입:
 """
 import json
 import os
+import sys
 import subprocess
 import time
 import logging
@@ -90,16 +91,30 @@ def _kaggle_env() -> dict:
     )
 
 
+def _kaggle_bin() -> str:
+    """
+    kaggle CLI 실행 경로를 반환한다.
+    systemd 가 venv/bin 을 PATH 에 넣지 않아도(서비스 PATH 미설정 시 rc=127 발생) 동작하도록,
+    실행 중인 파이썬(venv) 옆의 kaggle 바이너리를 우선 사용한다. (Windows/Linux 모두 호환)
+    """
+    bindir = os.path.dirname(sys.executable)
+    for name in ("kaggle", "kaggle.exe"):
+        cand = os.path.join(bindir, name)
+        if os.path.exists(cand):
+            return cand
+    return "kaggle"  # PATH 폴백
+
+
 def _run_kaggle_cmd(args: list, timeout: int = 60) -> Tuple[int, str, str]:
     """
     kaggle CLI 실행. (returncode, stdout, stderr) 반환.
     Args:
-        args: ["kernels", "push", "-p", "..."] 같은 인자 리스트 (앞에 'kaggle' 자동 추가)
+        args: ["kernels", "push", "-p", "..."] 같은 인자 리스트 (앞에 kaggle 바이너리 자동 추가)
         timeout: 단일 명령 타임아웃 (초)
     """
     try:
         proc = subprocess.run(
-            ["kaggle"] + args,
+            [_kaggle_bin()] + args,
             capture_output=True,
             text=True,
             timeout=timeout,
