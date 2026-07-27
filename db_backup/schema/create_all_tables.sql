@@ -227,3 +227,17 @@ CREATE TABLE IF NOT EXISTS access_tokens (
     expires_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+
+-- ============================================================
+-- 9. 테이블 접근 권한(GRANT) 부여 — 반드시 실행하세요!
+-- 최근 생성된 Supabase 프로젝트는 public 스키마 테이블에
+-- anon/authenticated 기본 GRANT가 없는 경우가 있어
+-- "permission denied for table ..." (42501, HTTP 403) 에러가 발생합니다.
+-- ============================================================
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
+-- 앞으로 새로 만들 테이블/시퀀스에도 자동 적용
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
