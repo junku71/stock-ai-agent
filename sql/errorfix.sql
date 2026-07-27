@@ -1,3 +1,14 @@
+-- 0) 테이블 권한(GRANT) 부여
+-- 최근 생성된 Supabase 프로젝트는 public 스키마 테이블에 anon/authenticated 기본 GRANT가
+-- 없는 경우가 있어 "permission denied for table ..." (42501, HTTP 403) 에러가 발생한다.
+-- 이 에러는 RLS 문제가 아니므로 아래 GRANT를 반드시 함께 실행해야 한다.
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
+-- 앞으로 새로 만들 테이블/시퀀스에도 자동 적용
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
+
 -- 1) RLS 비활성화
 ALTER TABLE IF EXISTS economic_and_stock_data DISABLE ROW LEVEL SECURITY;
 ALTER TABLE IF EXISTS stock_analysis_results DISABLE ROW LEVEL SECURITY;

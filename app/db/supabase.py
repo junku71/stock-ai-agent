@@ -1,3 +1,6 @@
+import base64
+import json
+
 from supabase import create_client, Client
 from app.core.config import settings
 
@@ -6,8 +9,26 @@ from app.core.config import settings
 url: str = settings.SUPABASE_URL
 key: str = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY
 
+
+def _key_role(k: str) -> str:
+    """키에 담긴 role(anon/service_role)을 판별한다. JWT가 아니면 형태로 추정."""
+    try:
+        payload = k.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # base64 패딩 보정
+        return json.loads(base64.urlsafe_b64decode(payload)).get("role", "알 수 없음")
+    except Exception:
+        if k.startswith("sb_secret_"):
+            return "service_role (신형 secret 키)"
+        if k.startswith("sb_publishable_"):
+            return "anon (신형 publishable 키)"
+        return "알 수 없음 (JWT 형식 아님 - 키를 다시 확인하세요)"
+
+
 if not settings.SUPABASE_SERVICE_ROLE_KEY:
     print("⚠️  SUPABASE_SERVICE_ROLE_KEY 미설정 - anon 키 사용 중. RLS가 켜져 있으면 쓰기가 차단될 수 있습니다.")
+
+# 어떤 키가 실제 적용됐는지 마스킹해서 출력 (에러 문의 시 스크린샷만으로 판별 가능)
+print(f"Supabase 키 role: {_key_role(key)} (끝 4자리: ...{key[-4:] if key else '없음'})")
 
 supabase: Client = create_client(url, key)
 
