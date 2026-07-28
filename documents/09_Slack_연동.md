@@ -42,7 +42,10 @@ KST 22:30~ 매도 모니터링 (1분마다)
 ### 3-1. 채널 + Webhook 만들기
 
 1. https://slack.com 워크스페이스 + 채널 (예: `#trading-bot`)
-2. https://api.slack.com/apps → **Create New App** → **From scratch**
+2. https://api.slack.com/apps → **Create New App**
+   - 구버전 화면: **From scratch** 선택
+   - 신버전 화면(템플릿 선택창이 뜨는 경우): **Blank app** 선택 ("From scratch"와 동일한 역할)
+     - AI agent / Starter app / From a manifest 은 선택하지 않습니다
 3. 앱 이름: `banbu-trading-bot` → 워크스페이스 선택 → **Create**
 4. 좌측 **Incoming Webhooks** → 토글 **ON**
 5. **Add New Webhook to Workspace** → 채널 선택 → **Allow**
