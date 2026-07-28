@@ -104,6 +104,9 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+        # .env에 정의되지 않은 변수(오타 포함)가 있어도 서버가 죽지 않도록 무시
+        # (수강생이 SUPABASE_SEVICE_ROLE_KEY 같은 오타를 내면 extra_forbidden으로 기동 실패하는 사례 방지)
+        extra = "ignore"
 
 # 싱글톤 설정 객체 생성
 settings = Settings()
