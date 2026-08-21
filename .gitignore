@@ -1,5 +1,6 @@
 # 환경 변수 (API 키, 시크릿)
 .env
+.env_dev
 .env.lecture
 deploy.sh
 status.sh

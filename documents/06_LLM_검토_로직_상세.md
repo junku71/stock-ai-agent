@@ -54,12 +54,12 @@ LLM은 **거부권만 있습니다**. 즉, BUY를 HOLD로 바꿀 수는 있어�
 
 ```python
 # llm_review_service.py:11
-MODELS = ["claude-opus-4-7", "claude-sonnet-4-6"]  # Opus 실패 시 Sonnet 폴백
+MODELS = ["claude-opus-5", "claude-sonnet-4-6"]  # Opus 실패 시 Sonnet 폴백
 ```
 
 | 우선순위 | 모델 ID | 특징 |
 |---|---|---|
-| 1순위 | `claude-opus-4-7` | Anthropic 최상위 모델 (정확도 ↑, 비용 ↑) |
+| 1순위 | `claude-opus-5` | Anthropic 최상위 모델 (정확도 ↑, 비용 ↑) |
 | 2순위 (폴백) | `claude-sonnet-4-6` | 중급 모델 (속도 ↑, 비용 ↓) |
 
 ### 폴백이 뭔가요?
@@ -236,7 +236,7 @@ LLM은 자유 형식(자연어)으로 답하는 게 기본인데, 자동매매 �
 ```python
 MAX_RETRIES = 3
 RETRY_DELAYS = [5, 15, 30]  # 5초 → 15초 → 30초
-MODELS = ["claude-opus-4-7", "claude-sonnet-4-6"]
+MODELS = ["claude-opus-5", "claude-sonnet-4-6"]
 
 # ...
 message = client.messages.create(

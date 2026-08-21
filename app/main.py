@@ -1,3 +1,11 @@
+import os
+import sys
+
+if __name__ == "__main__":
+    # app/main.py를 app/ 디렉토리에서 직접 실행할 때 `app` 패키지를 찾을 수 있도록
+    # 프로젝트 루트를 sys.path에 추가 (python run.py로 실행할 때는 불필요하지만 무해함)
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn

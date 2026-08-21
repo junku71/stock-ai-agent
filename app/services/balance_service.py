@@ -29,14 +29,40 @@ def current_account_type() -> str:
     return "mock" if settings.KIS_USE_MOCK else "real"
 
 
-def get_access_token():
+def get_access_token(force_refresh: bool = False):
     """한국투자증권 API 접근 토큰 발급 또는 캐시된 토큰 반환.
-    KIS_USE_MOCK 에 따라 mock/real 토큰을 분리해서 캐시/저장."""
+    KIS_USE_MOCK 에 따라 mock/real 토큰을 분리해서 캐시/저장.
+
+    force_refresh: True 면 메모리/DB 캐시된 만료시각을 무시하고 새 토큰을 발급.
+    KIS가 "기간이 만료된 token"(EGW00123) 등으로 거부했는데 로컬 expires_at은
+    아직 안 지난 경우(다른 프로세스가 먼저 재발급해 구 토큰이 서버측에서
+    선(先) 무효화된 경우 등) 캐시만 믿으면 같은 무효 토큰을 계속 재사용하게 되므로 필요.
+    """
     global _token_cache, _last_refresh_time
 
     token_type = _current_token_type()
     cache = _token_cache[token_type]
     now = datetime.now(pytz.UTC)
+
+    if force_refresh:
+        with _refresh_lock:
+            record_id = None
+            try:
+                response = supabase.table("access_tokens") \
+                    .select("id") \
+                    .eq("token_type", token_type) \
+                    .order("updated_at", desc=True) \
+                    .limit(1).execute()
+                if response.data:
+                    record_id = response.data[0]["id"]
+            except Exception as e:
+                print(f"강제 갱신 전 기존 토큰 조회 오류 ({token_type}): {str(e)}")
+
+            token = refresh_token_with_retry(token_type=token_type, record_id=record_id)
+            cache["access_token"] = token
+            cache["expires_at"] = now + timedelta(days=1)
+            _last_refresh_time[token_type] = time.time()
+            return token
 
     # 메모리 캐시 (해당 모드 슬롯) 가 유효하면 사용
     if cache["access_token"] and cache["expires_at"] and now < cache["expires_at"]:
@@ -187,7 +213,7 @@ def get_domestic_balance():
                 if "초당" in msg1:
                     time.sleep(2)
                 else:
-                    access_token = get_access_token()
+                    access_token = get_access_token(force_refresh=True)
                     headers["authorization"] = f"Bearer {access_token}"
                     time.sleep(1)
                 continue
@@ -244,7 +270,7 @@ def get_overseas_balance(ovrs_excg_cd="NASD"):
                 if "초당" in msg1:
                     time.sleep(2)
                 else:
-                    access_token = get_access_token()
+                    access_token = get_access_token(force_refresh=True)
                     headers["authorization"] = f"Bearer {access_token}"
                     time.sleep(1)
                 continue
