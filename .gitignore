@@ -9,6 +9,7 @@ status.sh
 .kaggle/
 kaggle.json
 kaggle_notebook/predict.ipynb
+kaggle_notebook_kr/predict_kr.ipynb
 
 # 가상환경
 .venv/

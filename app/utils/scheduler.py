@@ -16,6 +16,7 @@ import logging
 from app.services.economic_service import update_economic_data_in_background
 from app.services.llm_review_service import review_buy_candidates
 from app.services.ml_trigger_service import trigger_and_wait
+from app.services.position_sizing import compute_weighted_slots, describe_allocation
 from app.services.notification_service import (
     notify_data_ready,
     notify_llm_decisions,
@@ -32,7 +33,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('stock_scheduler.log')
+        # encoding 을 지정하지 않으면 Windows 에서 cp949 로 기록돼, 로그에
+        # '—' / '→' / '⚠️' 가 있으면 파일 쓰기가 UnicodeEncodeError 로 실패한다.
+        logging.FileHandler('stock_scheduler.log', encoding='utf-8')
     ]
 )
 logger = logging.getLogger('stock_scheduler')
@@ -622,9 +625,87 @@ class StockScheduler:
             return
 
         logger.info(f"LLM 검토 통과: {len(buy_candidates)}개 종목 매수 진행")
+
+        # ── 포지션 사이징 (루프 전에 1회 확정) ─────────────────────
+        # 이전 구현은 종목마다 inquire_psamount 를 다시 불러 total_assets 를 재계산했다.
+        # 그런데 initial_holdings_value 는 루프 전 보유분만 담고 있어서, 이번 회차에 산
+        # 종목은 현금에서만 빠지고 보유평가에는 안 잡힌다. 결과적으로 총자산이 매 종목마다
+        # 줄어 슬롯이 10% → 9% → 8.1% … 로 감쇠했다 (주석의 "모든 종목 동일 비중"과 불일치).
+        # → 총자산과 슬롯을 루프 전에 확정하고, 남은 현금만 지역 변수로 차감한다. (KR 트랙과 동일)
+        cash_basis = "foreign" if settings.KIS_USE_MOCK else settings.US_CASH_BASIS
+        available_cash = 0.0
+        try:
+            probe = buy_candidates[0]
+            probe_price = float(probe.get("last_price") or 0) or 1.0
+            ps_result = inquire_psamount({
+                "CANO": settings.KIS_CANO,
+                "ACNT_PRDT_CD": settings.KIS_ACNT_PRDT_CD,
+                "OVRS_EXCG_CD": TICKER_TO_EXCHANGE.get(probe["ticker"].split(".")[0], "NASD"),
+                "OVRS_ORD_UNPR": str(round(probe_price, 2)),
+                "ITEM_CD": probe["ticker"].split(".")[0],
+            })
+            if ps_result.get("rt_cd") != "0":
+                logger.error(f"매수가능금액 조회 실패 — 매수 중단: {ps_result.get('msg1', '')}")
+                return
+            out = ps_result.get("output", {})
+            integrated = float(out.get("frcr_ord_psbl_amt1", 0) or 0)   # 앱 "통합" 금액
+            foreign = float(out.get("ovrs_ord_psbl_amt", 0) or 0)       # 앱 "외화" 금액
+            available_cash = foreign if cash_basis == "foreign" else (integrated or foreign)
+            logger.info(
+                f"매수 여력: 통합 ${integrated:,.2f} / 외화 ${foreign:,.2f} "
+                f"→ 기준 '{cash_basis}' ${available_cash:,.2f}"
+            )
+        except Exception as ps_e:
+            logger.error(f"매수가능금액 조회 오류 — 매수 중단: {ps_e}", exc_info=True)
+            return
+
+        if available_cash <= 0:
+            logger.info("매수가능금액이 없습니다. 이번 회차 매수를 건너뜁니다.")
+            return
+
+        total_assets = available_cash + initial_holdings_value
+        slot_ratios = compute_weighted_slots(
+            scores=[c.get("composite_score") for c in buy_candidates],
+            base_ratio=settings.US_SLOT_RATIO,
+            tilt=settings.US_SLOT_TILT,
+            min_ratio=settings.US_MIN_SLOT_RATIO,
+            max_ratio=settings.US_MAX_SLOT_RATIO,
+            max_total_exposure=settings.US_MAX_TOTAL_EXPOSURE,
+            method=settings.US_SLOT_METHOD,
+        )
+        logger.info(
+            f"총자산 ${total_assets:,.2f} (현금 ${available_cash:,.2f} + 보유평가 ${initial_holdings_value:,.2f})"
+        )
+        logger.info(
+            f"배분 방식: {settings.US_SLOT_METHOD} / tilt={settings.US_SLOT_TILT} "
+            f"(기준 {settings.US_SLOT_RATIO:.0%}, 종목당 {settings.US_MIN_SLOT_RATIO:.0%}~"
+            f"{settings.US_MAX_SLOT_RATIO:.0%}, 총 노출 상한 {settings.US_MAX_TOTAL_EXPOSURE:.0%}) "
+            f"→ 총 {sum(slot_ratios) * 100:.1f}%"
+        )
+        for line in describe_allocation(
+            [c.get("stock_name") or c.get("ticker") for c in buy_candidates],
+            [c.get("composite_score") for c in buy_candidates],
+            slot_ratios, total_assets,
+        ):
+            logger.info(line)
+
+        # 현금 부족 시 비례 축소.
+        #   슬롯은 '총자산' 기준인데 가용 현금은 그보다 훨씬 적을 수 있다(보유 비중이 클 때).
+        #   그대로 두면 상위 1~2종목이 현금을 다 쓰고 하위 종목은 0주가 되어 분산이 깨진다.
+        #   → 배분 비율은 유지한 채 전체를 현금 한도에 맞춰 줄인다.
+        target_total = total_assets * sum(slot_ratios)
+        cash_scale = 1.0
+        if target_total > available_cash > 0:
+            cash_scale = available_cash / target_total
+            logger.warning(
+                f"현금 부족: 목표 배분 ${target_total:,.2f} > 가용 현금 ${available_cash:,.2f} "
+                f"→ 전 종목 {cash_scale * 100:.1f}% 로 비례 축소 (배분 비율은 유지)"
+            )
+
+        remaining_cash = available_cash
         
         # 각 종목에 대해 API 호출하여 현재 체결가 조회 및 매수 주문
-        for candidate in buy_candidates:
+        for idx, candidate in enumerate(buy_candidates):
             try:
                 ticker = candidate["ticker"]
                 stock_name = candidate["stock_name"]
@@ -667,56 +748,26 @@ class StockScheduler:
                 # 이전: $390.8506 같은 4자리 가격이 KIS에 거부당함
                 current_price = round(current_price, 2 if current_price >= 1.0 else 4)
 
-                await asyncio.sleep(2)  # KIS API 초당 제한 방지
-                # 매수가능금액 조회 → ★ 총자산 기준 종목당 10% 투자
-                try:
-                    ps_params = {
-                        "CANO": settings.KIS_CANO,
-                        "ACNT_PRDT_CD": settings.KIS_ACNT_PRDT_CD,
-                        "OVRS_EXCG_CD": exchange_code,
-                        "OVRS_ORD_UNPR": str(current_price),
-                        "ITEM_CD": pure_ticker,
-                    }
-                    ps_result = inquire_psamount(ps_params)
+                # ── 확신도 가중 슬롯 (루프 전에 확정된 값 사용) ──
+                slot_ratio = slot_ratios[idx]
+                slot_amount = total_assets * slot_ratio * cash_scale
+                # 남은 현금 한도 반영 — 앞 종목이 쓰고 남은 만큼만 쓸 수 있다
+                invest_amount = min(slot_amount, remaining_cash)
 
-                    if ps_result.get("rt_cd") != "0":
-                        logger.error(f"{stock_name}({ticker}) 매수가능금액 조회 실패: {ps_result.get('msg1', '')}")
-                        continue
-
-                    # 외화주문가능금액 추출 (원화통합계좌: 원화 자동환전 포함 금액)
-                    ps_output = ps_result.get("output", {})
-                    available_amount = float(ps_output.get("frcr_ord_psbl_amt1", 0) or ps_output.get("ovrs_ord_psbl_amt", 0))
-                    if available_amount <= 0:
-                        logger.info(f"{stock_name}({ticker}) 매수가능금액이 없습니다.")
-                        continue
-
-                    # ★ 패치: 총자산(현금 + 보유 평가) 기준 종목당 10% 슬롯 크기 (모든 종목 동일)
-                    # 이전: available_amount * 0.10 → 종목 살 때마다 가용현금이 줄어 다음 종목 슬롯이 작아지는 문제
-                    # 현재: 총자산 기준 고정 슬롯 → 모든 종목에 동일한 비중 투자
-                    total_assets = available_amount + initial_holdings_value
-                    invest_amount = total_assets * 0.10
-
-                    # 가용 현금이 슬롯보다 적으면 가용 현금 한도로 조정
-                    if invest_amount > available_amount:
-                        logger.warning(
-                            f"{stock_name}({ticker}) 가용현금 부족: 슬롯 ${invest_amount:.2f} > 현금 ${available_amount:.2f} → 가용현금 한도로 조정"
-                        )
-                        invest_amount = available_amount
-
-                    quantity = int(invest_amount / current_price)
-
-                    if quantity < 1:
-                        logger.info(f"{stock_name}({ticker}) 투자금(${invest_amount:.2f})으로 1주도 살 수 없습니다. (현재가 ${current_price})")
-                        continue
-
+                quantity = int(invest_amount / current_price)
+                if quantity < 1:
                     logger.info(
-                        f"{stock_name}({ticker}) 총자산: ${total_assets:,.2f} "
-                        f"(현금 ${available_amount:,.2f} + 보유평가 ${initial_holdings_value:,.2f}), "
-                        f"종목당 슬롯(10%): ${invest_amount:,.2f}, 수량: {quantity}주"
+                        f"{stock_name}({ticker}) 투자금 ${invest_amount:,.2f}"
+                        f"(비중 {slot_ratio * 100:.1f}%)으로 1주도 살 수 없습니다. "
+                        f"(현재가 ${current_price})"
                     )
-                except Exception as ps_e:
-                    logger.error(f"{stock_name}({ticker}) 매수가능금액 조회 오류: {ps_e}")
                     continue
+
+                logger.info(
+                    f"{stock_name}({ticker}) 슬롯 {slot_ratio * 100:.1f}% = ${slot_amount:,.2f}, "
+                    f"실투자 ${invest_amount:,.2f}, 수량 {quantity}주 "
+                    f"(남은 현금 ${remaining_cash:,.2f})"
+                )
 
                 # ★ ATR 계산을 매수 주문 _전_ 으로 이동 (null 시 매수 차단)
                 #   기존 흐름: 주문 → ATR 계산 → 실패 시 NULL 로 INSERT (위험)
@@ -764,6 +815,7 @@ class StockScheduler:
                 if order_result.get("rt_cd") == "0":
                     logger.info(f"{stock_name}({ticker}) 매수 주문 성공: {order_result.get('msg1', '주문이 접수되었습니다.')}")
                     holding_tickers.add(pure_ticker)  # 중복 매수 방지
+                    remaining_cash -= quantity * current_price  # 남은 현금 반영
                     any_buy_succeeded = True  # ★ 패치: 매수 1건 이상 성공 시 _last_buy_date 갱신
 
                     # ★ ③ 매수 주문 접수 Slack 알림 (실제 체결은 _reconcile_orders 에서 별도 발송)

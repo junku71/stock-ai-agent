@@ -73,11 +73,112 @@ class Settings(BaseSettings):
     SLACK_WEBHOOK_URL: str = os.getenv("SLACK_WEBHOOK_URL", "")
     SLACK_NOTIFY_LEVEL: str = os.getenv("SLACK_NOTIFY_LEVEL", "info")
 
+    # ══════════════════════════════════════════════════════════════
+    # 미국 트랙 포지션 사이징 (app/services/position_sizing.py 공유)
+    # ══════════════════════════════════════════════════════════════
+    US_SLOT_RATIO: float = float(os.getenv("US_SLOT_RATIO", "0.10"))
+
+    # 확신도 가중 배분. 0.0 이면 전 종목 균등(기존 동작), 0.5 면 1위 1.5배·꼴찌 0.5배
+    US_SLOT_TILT: float = float(os.getenv("US_SLOT_TILT", "0.5"))
+    US_SLOT_METHOD: str = os.getenv("US_SLOT_METHOD", "rank")  # rank | score
+    US_MIN_SLOT_RATIO: float = float(os.getenv("US_MIN_SLOT_RATIO", "0.05"))
+    US_MAX_SLOT_RATIO: float = float(os.getenv("US_MAX_SLOT_RATIO", "0.20"))
+    US_MAX_TOTAL_EXPOSURE: float = float(os.getenv("US_MAX_TOTAL_EXPOSURE", "0.80"))
+
+    # 매수 여력의 기준 (inquire-psamount 응답 중 어느 필드를 현금으로 볼지)
+    #   "integrated" — frcr_ord_psbl_amt1 (앱의 "통합" 금액, 원화 자동환전 포함)
+    #                  원화통합증거금 계좌에서 원화까지 끌어 쓰려면 이 값.
+    #   "foreign"    — ovrs_ord_psbl_amt (앱의 "외화" 금액, 보유 외화만)
+    #                  실제 보유 외화만 쓴다. 자동환전을 원치 않거나 모의계좌면 이 쪽.
+    #   ※ 모의투자에서는 integrated 값이 실가용액의 7배 이상으로 나와 주문이 거부된다.
+    #     KIS_USE_MOCK=true 면 코드가 자동으로 foreign 을 쓴다.
+    US_CASH_BASIS: str = os.getenv("US_CASH_BASIS", "integrated")
+
     # Cross-sectional z-score 점수 시스템 v2 활성화
     # false: v1 (raw weighted sum) 으로 매수 결정, v2 점수는 로깅만
     # true:  v2 (z-score) 로 매수 결정
     # 참조: documents/10_멀티팩터_변별력_개선_기획.md
     USE_SCORING_V2: bool = os.getenv("USE_SCORING_V2", "false").lower() == "true"
+
+    # ══════════════════════════════════════════════════════════════
+    # 국내주식(KOSPI 100) 트랙 설정
+    #   기존 미국 트랙과 병행 운영. KR_ENABLED=false 면 KR 스케줄러 미기동.
+    #   참조: documents/20_국내주식_KOSPI30_설계.md
+    # ══════════════════════════════════════════════════════════════
+    KR_ENABLED: bool = os.getenv("KR_ENABLED", "false").lower() == "true"
+
+    # true 면 KIS 주문 API 를 호출하지 않고 로그만 남김 (로직 검증용 드라이런)
+    KR_DRY_RUN: bool = os.getenv("KR_DRY_RUN", "false").lower() == "true"
+
+    # ML 예측 신뢰도 하한 (%). Transformer 방향성 정확도(100 - MAPE)가 이 값 미만인
+    # 종목은 매수 후보에서 제외한다. 정확도 낮은 예측이 z-score 상위를 차지하는 것을 막는다.
+    #   0 으로 두면 필터를 끈다.
+    KR_MIN_ML_ACCURACY: float = float(os.getenv("KR_MIN_ML_ACCURACY", "80"))
+
+    # 예측 상승률 하한 (%)
+    KR_MIN_RISE_PROBABILITY: float = float(os.getenv("KR_MIN_RISE_PROBABILITY", "2"))
+
+    # 종목당 기준 투자 비중 (총자산 대비) / 동시 보유 최대 종목 수
+    KR_SLOT_RATIO: float = float(os.getenv("KR_SLOT_RATIO", "0.10"))
+    KR_MAX_POSITIONS: int = int(os.getenv("KR_MAX_POSITIONS", "8"))
+
+    # ── 확신도 가중 배분 (app/services/position_sizing.py) ──
+    # 종합점수가 높은 종목에 더 많이 배분한다.
+    #   0.0 → 전 종목 균등 (KR_SLOT_RATIO 그대로, 기존 동작)
+    #   0.5 → 1위 1.5×, 중간 1.0×, 꼴찌 0.5× (권장)
+    #   1.0 → 1위 2.0×, 꼴찌 0×
+    KR_SLOT_TILT: float = float(os.getenv("KR_SLOT_TILT", "0.5"))
+
+    # rank: 순위 등간격 (총 투입액이 종목 수로 고정, 이상치에 강함 — 권장)
+    # score: 점수 차 크기 반영 (이상치 하나가 나머지를 바닥으로 눌러버릴 수 있음)
+    KR_SLOT_METHOD: str = os.getenv("KR_SLOT_METHOD", "rank")
+
+    # 개별 종목 비중 하한/상한, 총 투입 비율 상한
+    KR_MIN_SLOT_RATIO: float = float(os.getenv("KR_MIN_SLOT_RATIO", "0.05"))
+    KR_MAX_SLOT_RATIO: float = float(os.getenv("KR_MAX_SLOT_RATIO", "0.20"))
+    KR_MAX_TOTAL_EXPOSURE: float = float(os.getenv("KR_MAX_TOTAL_EXPOSURE", "0.80"))
+
+    # 시장 데이터 수집 기간 (년). 백필 시작일 = 오늘 - 이 값.
+    #   종목이 100개라 기간이 길수록 수집·학습 시간이 선형으로 늘어난다.
+    #   5년이면 코로나 이후 국면 + 금리 인상/인하 사이클을 포함한다.
+    KR_HISTORY_YEARS: int = int(os.getenv("KR_HISTORY_YEARS", "5"))
+
+    # 분석 파이프라인(장 마감 후) / 매수 집행(장 시작 후) 시각 — 모두 KST
+    KR_ANALYSIS_TIME: str = os.getenv("KR_ANALYSIS_TIME", "16:30")
+    KR_EXECUTION_TIME: str = os.getenv("KR_EXECUTION_TIME", "09:05")
+
+    # NAVER API Hub (구 openapi.naver.com 검색 API 의 이관처)
+    #   콘솔: NAVER Cloud Platform → NAVER API HUB
+    NAVER_API_KEY_ID: str = os.getenv("NAVER_API_KEY_ID", "")
+    NAVER_API_KEY: str = os.getenv("NAVER_API_KEY", "")
+    NAVER_API_HUB_BASE: str = os.getenv(
+        "NAVER_API_HUB_BASE", "https://naverapihub.apigw.ntruss.com"
+    )
+    # 데이터랩(검색어 트렌드)은 검색 API 와 별개 상품이라 호스트가 다르다.
+    #   검색   : naverapihub.apigw.ntruss.com   (NAVER API HUB)
+    #   데이터랩: naveropenapi.apigw.ntruss.com  (AI·NAVER API)
+    # 상품을 따로 신청해야 권한이 열린다 (미신청 시 401).
+    NAVER_DATALAB_BASE: str = os.getenv(
+        "NAVER_DATALAB_BASE", "https://naveropenapi.apigw.ntruss.com"
+    )
+
+    # 뉴스 감성 스코어링 모델 (기사 텍스트 → -1~+1 점수)
+    #   네이버 검색 API 는 AlphaVantage 와 달리 감성 점수를 주지 않으므로 직접 산출한다.
+    KR_SENTIMENT_MODEL: str = os.getenv("KR_SENTIMENT_MODEL", "claude-opus-5")
+    KR_SENTIMENT_LOOKBACK_DAYS: int = int(os.getenv("KR_SENTIMENT_LOOKBACK_DAYS", "3"))
+
+    # KRX Open API (openapi.krx.co.kr) — 시장 전체 시세/지수. 없으면 해당 수집만 스킵.
+    KRX_AUTH_KEY: str = os.getenv("KRX_AUTH_KEY", "")
+
+    # 한국은행 ECOS OpenAPI — 한국 거시지표 (FRED 의 한국판)
+    ECOS_API_KEY: str = os.getenv("ECOS_API_KEY", "")
+
+    # OpenDART — 공시/재무제표 (실적 리스크 판단 보강용, 선택)
+    DART_API_KEY: str = os.getenv("DART_API_KEY", "")
+
+    # KR ML 예측 전용 Kaggle 커널 (미국 커널과 분리)
+    KAGGLE_KERNEL_SLUG_KR: str = os.getenv("KAGGLE_KERNEL_SLUG_KR", "stock-prediction-kr")
+    KAGGLE_NOTEBOOK_DIR_KR: str = os.getenv("KAGGLE_NOTEBOOK_DIR_KR", "kaggle_notebook_kr")
 
     @property
     def kis_base_url(self) -> str:

@@ -39,19 +39,23 @@ TERMINAL_OK = {"complete"}
 TERMINAL_ERR = {"error", "cancel_acknowledged", "cancel_requested"}
 
 
-def _kernel_ref() -> str:
-    """`username/slug` 형태의 kernel reference 반환 (Kaggle 실제 username 기준)"""
+def _kernel_ref(kernel_slug: Optional[str] = None) -> str:
+    """`username/slug` 형태의 kernel reference 반환 (Kaggle 실제 username 기준)
+
+    kernel_slug 를 주면 그 커널을, 생략하면 .env 의 KAGGLE_KERNEL_SLUG(미국 트랙)를 쓴다.
+    국내 트랙은 별도 커널(KAGGLE_KERNEL_SLUG_KR)을 쓰므로 이 인자를 넘긴다.
+    """
     if not settings.KAGGLE_USERNAME:
         raise RuntimeError(
             "KAGGLE_USERNAME 이 .env 에 설정되지 않았습니다 "
             "(토큰 이름이 아닌 실제 Kaggle 계정 username 사용)"
         )
-    return f"{settings.KAGGLE_USERNAME}/{settings.KAGGLE_KERNEL_SLUG}"
+    return f"{settings.KAGGLE_USERNAME}/{kernel_slug or settings.KAGGLE_KERNEL_SLUG}"
 
 
-def _notebook_dir() -> Path:
-    """kaggle_notebook 폴더 절대경로"""
-    p = Path(settings.KAGGLE_NOTEBOOK_DIR)
+def _notebook_dir(notebook_dir: Optional[str] = None) -> Path:
+    """노트북 폴더 절대경로 (생략 시 .env 의 KAGGLE_NOTEBOOK_DIR)"""
+    p = Path(notebook_dir or settings.KAGGLE_NOTEBOOK_DIR)
     if not p.is_absolute():
         # 프로젝트 루트(이 파일의 부모의 부모의 부모) 기준 상대경로 해석
         project_root = Path(__file__).resolve().parents[2]
@@ -211,7 +215,7 @@ def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
         json.dump(nb, f, ensure_ascii=False, indent=1)
 
 
-def _sync_metadata_id(meta_path: Path) -> Optional[str]:
+def _sync_metadata_id(meta_path: Path, kernel_slug: Optional[str] = None) -> Optional[str]:
     """
     kernel-metadata.json 의 "id" 를 .env 기준(`KAGGLE_USERNAME/KAGGLE_KERNEL_SLUG`)으로 맞춘다.
 
@@ -224,7 +228,7 @@ def _sync_metadata_id(meta_path: Path) -> Optional[str]:
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    want = _kernel_ref()
+    want = _kernel_ref(kernel_slug)
     old = meta.get("id")
     if old == want:
         return None
@@ -235,16 +239,25 @@ def _sync_metadata_id(meta_path: Path) -> Optional[str]:
     return old
 
 
-def push_kernel() -> Tuple[bool, str]:
+def push_kernel(
+    kernel_slug: Optional[str] = None,
+    notebook_dir: Optional[str] = None,
+    script_name: str = "predict.py",
+) -> Tuple[bool, str]:
     """
     노트북 push (= 새 버전 + 실행 트리거).
-    push 직전에 predict.py + .env secrets 로 predict.ipynb 를 새로 생성.
+    push 직전에 {script_name} + .env secrets 로 동명의 .ipynb 를 새로 생성.
+
+    Args:
+        kernel_slug:  대상 커널 slug (생략 시 미국 트랙 KAGGLE_KERNEL_SLUG)
+        notebook_dir: 노트북 폴더 (생략 시 KAGGLE_NOTEBOOK_DIR)
+        script_name:  변환할 파이썬 스크립트 파일명
 
     Returns: (success, message)
     """
-    nb_dir = _notebook_dir()
+    nb_dir = _notebook_dir(notebook_dir)
     if not nb_dir.exists():
-        msg = f"노트북 폴더가 없음: {nb_dir} (kernel-metadata.json + predict.py 필요)"
+        msg = f"노트북 폴더가 없음: {nb_dir} (kernel-metadata.json + {script_name} 필요)"
         logger.error(msg)
         return False, msg
 
@@ -256,11 +269,11 @@ def push_kernel() -> Tuple[bool, str]:
 
     # 메타데이터 id 를 내 계정 기준으로 교정 (남의 계정 id 로 push 시 권한 거부 방지)
     try:
-        replaced = _sync_metadata_id(meta_path)
+        replaced = _sync_metadata_id(meta_path, kernel_slug)
         if replaced:
             logger.warning(
-                f"kernel-metadata.json id 교정: {replaced!r} -> {_kernel_ref()!r} "
-                "(.env 의 KAGGLE_USERNAME/KAGGLE_KERNEL_SLUG 기준)"
+                f"kernel-metadata.json id 교정: {replaced!r} -> {_kernel_ref(kernel_slug)!r} "
+                "(.env 의 KAGGLE_USERNAME / 커널 slug 기준)"
             )
     except Exception as e:
         msg = f"kernel-metadata.json id 교정 실패: {e}"
@@ -268,16 +281,16 @@ def push_kernel() -> Tuple[bool, str]:
         return False, msg
 
     # secrets 주입된 ipynb 생성
-    py_path = nb_dir / "predict.py"
-    ipynb_path = nb_dir / "predict.ipynb"
+    py_path = nb_dir / script_name
+    ipynb_path = nb_dir / f"{Path(script_name).stem}.ipynb"
     if not py_path.exists():
-        msg = f"predict.py 없음: {py_path} (secrets 주입 위해 .py 원본 필요)"
+        msg = f"{script_name} 없음: {py_path} (secrets 주입 위해 .py 원본 필요)"
         logger.error(msg)
         return False, msg
 
     try:
         _build_ipynb_with_injected_secrets(py_path, ipynb_path)
-        logger.info(f"predict.ipynb 재생성 완료 (secrets 주입됨)")
+        logger.info(f"{ipynb_path.name} 재생성 완료 (secrets 주입됨)")
     except Exception as e:
         msg = f"ipynb 생성 실패: {e}"
         logger.error(msg, exc_info=True)
@@ -294,13 +307,13 @@ def push_kernel() -> Tuple[bool, str]:
     return True, out_msg
 
 
-def get_status() -> str:
+def get_status(kernel_slug: Optional[str] = None) -> str:
     """
     현재 실행 상태 조회.
     Returns: 'complete' / 'running' / 'queued' / 'error' /
              'cancel_requested' / 'cancel_acknowledged' / 'unknown'
     """
-    rc, out, err = _run_kaggle_cmd(["kernels", "status", _kernel_ref()])
+    rc, out, err = _run_kaggle_cmd(["kernels", "status", _kernel_ref(kernel_slug)])
     if rc != 0:
         logger.warning(f"status 조회 실패 (rc={rc}): {err.strip() or out.strip()}")
         return "unknown"
@@ -317,9 +330,15 @@ def get_status() -> str:
 def trigger_and_wait(
     poll_interval: int = POLL_INTERVAL_SEC,
     max_wait: int = MAX_WAIT_SEC,
+    kernel_slug: Optional[str] = None,
+    notebook_dir: Optional[str] = None,
+    script_name: str = "predict.py",
 ) -> Tuple[bool, str, dict]:
     """
     push로 트리거 → 완료될 때까지 폴링.
+
+    kernel_slug / notebook_dir / script_name 을 생략하면 미국 트랙 커널을 쓴다.
+    국내 트랙은 KAGGLE_KERNEL_SLUG_KR / KAGGLE_NOTEBOOK_DIR_KR / predict_kr.py 를 넘긴다.
 
     Returns:
         (success: bool, message: str, meta: dict)
@@ -332,7 +351,7 @@ def trigger_and_wait(
     start = time.time()
 
     # 1) push (= 트리거)
-    pushed, push_msg = push_kernel()
+    pushed, push_msg = push_kernel(kernel_slug, notebook_dir, script_name)
     if not pushed:
         return False, push_msg, {"elapsed_sec": 0, "final_status": "push_failed", "push_output": push_msg}
 
@@ -352,7 +371,7 @@ def trigger_and_wait(
             }
 
         time.sleep(poll_interval)
-        status = get_status()
+        status = get_status(kernel_slug)
 
         if status != last_status:
             logger.info(f"  [{elapsed}s] 상태: {status}")

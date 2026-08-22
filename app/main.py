@@ -11,12 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from app.api.api import api_router
 from app.services.economic_service import update_economic_data_in_background
+from app.core.config import settings
 from app.utils.scheduler import (
     start_scheduler, stop_scheduler,
     start_sell_scheduler, stop_sell_scheduler,
     start_economic_data_scheduler, stop_economic_data_scheduler,
     start_daily_pipeline_scheduler, stop_daily_pipeline_scheduler,
 )
+from app.utils.kr_scheduler import start_kr_scheduler, stop_kr_scheduler
 from contextlib import asynccontextmanager
 import threading
 
@@ -30,6 +32,8 @@ async def lifespan(app: FastAPI):
     stop_sell_scheduler()  # 매도 스케줄러 종료
     stop_economic_data_scheduler()  # 경제 데이터 스케줄러 종료
     stop_daily_pipeline_scheduler()  # 일일 통합 파이프라인 스케줄러 종료
+    if settings.KR_ENABLED:
+        stop_kr_scheduler()  # 국내주식(KOSPI 100) 스케줄러 종료
 
 app = FastAPI(title="주식 분석 및 추천 API", lifespan=lifespan)
 
@@ -62,6 +66,14 @@ async def startup():
 
     # 일일 통합 파이프라인 스케줄러 시작 (매일 KST 21:00)
     start_daily_pipeline_scheduler()
+
+    # 국내주식(KOSPI 100) 트랙 — KR_ENABLED=true 일 때만 기동.
+    # 미국 트랙과 독립된 schedule 인스턴스를 쓰므로 서로 간섭하지 않는다.
+    if settings.KR_ENABLED:
+        print("국내주식(KOSPI 100) 스케줄러를 시작합니다...")
+        start_kr_scheduler()
+    else:
+        print("KR_ENABLED=false — 국내주식 스케줄러는 기동하지 않습니다.")
 
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)
