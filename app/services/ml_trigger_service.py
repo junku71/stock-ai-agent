@@ -73,8 +73,20 @@ def _kaggle_env() -> dict:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
 
-    if settings.KAGGLE_API_TOKEN:
-        env["KAGGLE_API_TOKEN"] = settings.KAGGLE_API_TOKEN
+    # .env 에서 신형 토큰(KGAT_*)을 구형 변수명 KAGGLE_KEY 에 넣어둔 경우도 구제한다.
+    # (구형 KAGGLE_KEY 경로로 KGAT_ 토큰을 넘기면 CLI 가 "Authentication required" 로 거부함)
+    api_token = settings.KAGGLE_API_TOKEN
+    if not api_token and settings.KAGGLE_KEY.startswith("KGAT_"):
+        api_token = settings.KAGGLE_KEY
+        logger.warning(
+            "KAGGLE_KEY 에 신형 Access Token(KGAT_*)이 들어있습니다. "
+            "KAGGLE_API_TOKEN 으로 처리합니다 — .env 변수명을 KAGGLE_API_TOKEN 으로 바꾸세요."
+        )
+
+    if api_token:
+        env["KAGGLE_API_TOKEN"] = api_token
+        # 셸/systemd 에 남아있는 구형 KAGGLE_KEY 가 신형 인증을 방해하지 않도록 제거
+        env.pop("KAGGLE_KEY", None)
         # KAGGLE_API_TOKEN 만으로 인증되지만, username 도 같이 넘기면 메타데이터 검증에 도움
         if settings.KAGGLE_USERNAME:
             env["KAGGLE_USERNAME"] = settings.KAGGLE_USERNAME
@@ -87,7 +99,7 @@ def _kaggle_env() -> dict:
 
     raise RuntimeError(
         "Kaggle 인증 정보가 .env 에 없습니다. "
-        "(KAGGLE_API_TOKEN 또는 KAGGLE_USERNAME+KAGGLE_KEY 둘 중 하나 설정 필요)"
+        "(KAGGLE_API_TOKEN=KGAT_... 또는 KAGGLE_USERNAME+KAGGLE_KEY(32자리 hex) 둘 중 하나 설정 필요)"
     )
 
 
@@ -199,6 +211,30 @@ def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
         json.dump(nb, f, ensure_ascii=False, indent=1)
 
 
+def _sync_metadata_id(meta_path: Path) -> Optional[str]:
+    """
+    kernel-metadata.json 의 "id" 를 .env 기준(`KAGGLE_USERNAME/KAGGLE_KERNEL_SLUG`)으로 맞춘다.
+
+    저장소에 커밋된 id 는 다른 계정(예: 강사 계정)으로 박혀있을 수 있는데,
+    그대로 push 하면 남의 kernel 을 건드리려다 권한 거부로 실패한다.
+    각자 자기 계정으로 push 되도록 push 직전에 교정한다.
+
+    Returns: 교정한 경우 이전 id, 이미 맞으면 None
+    """
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    want = _kernel_ref()
+    old = meta.get("id")
+    if old == want:
+        return None
+
+    meta["id"] = want
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return old
+
+
 def push_kernel() -> Tuple[bool, str]:
     """
     노트북 push (= 새 버전 + 실행 트리거).
@@ -212,9 +248,23 @@ def push_kernel() -> Tuple[bool, str]:
         logger.error(msg)
         return False, msg
 
-    if not (nb_dir / "kernel-metadata.json").exists():
+    meta_path = nb_dir / "kernel-metadata.json"
+    if not meta_path.exists():
         msg = f"kernel-metadata.json 없음: {nb_dir}"
         logger.error(msg)
+        return False, msg
+
+    # 메타데이터 id 를 내 계정 기준으로 교정 (남의 계정 id 로 push 시 권한 거부 방지)
+    try:
+        replaced = _sync_metadata_id(meta_path)
+        if replaced:
+            logger.warning(
+                f"kernel-metadata.json id 교정: {replaced!r} -> {_kernel_ref()!r} "
+                "(.env 의 KAGGLE_USERNAME/KAGGLE_KERNEL_SLUG 기준)"
+            )
+    except Exception as e:
+        msg = f"kernel-metadata.json id 교정 실패: {e}"
+        logger.error(msg, exc_info=True)
         return False, msg
 
     # secrets 주입된 ipynb 생성

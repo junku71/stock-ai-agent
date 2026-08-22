@@ -1,0 +1,41 @@
+현재 `test` 브랜치로 이동해 있고, 아직 원격(remote)에는 없는 로컬 브랜치예요.
+
+## Git 버전 관리, 쉽게 설명
+
+Git은 파일의 "스냅샷 역사"를 관리하는 도구예요. 핵심 개념 4가지만 이해하면 됩니다.
+
+1. **Working Directory (작업 폴더)** — 지금 눈에 보이는 실제 파일들. 코드를 수정하면 여기가 바뀝니다.
+2. **Staging Area (스테이징)** — "이번 커밋에 포함할 변경사항"을 담아두는 곳. `git add`로 여기에 올립니다.
+3. **Commit (커밋)** — 스테이징된 변경사항을 하나의 "버전"으로 저장. `git commit`으로 만듭니다. 커밋마다 고유 ID(해시)가 있고, 언제든 되돌아갈 수 있는 체크포인트예요.
+4. **Branch (브랜치)** — 커밋들의 흐름(줄기). `main`은 보통 "완성된/안정적인" 흐름이고, `test`처럼 새 브랜치를 만들면 `main`을 건드리지 않고 독립적으로 실험할 수 있어요.
+
+**Local vs Remote**: 지금까지 한 작업(`add`, `commit`, `checkout -b`)은 전부 내 컴퓨터(local)에만 있습니다. GitHub(remote)에는 아직 반영 안 됨. `push`를 해야 원격 저장소에 올라갑니다.
+
+```
+작업 폴더 --(git add)--> 스테이징 --(git commit)--> 로컬 커밋 --(git push)--> 원격 저장소(GitHub)
+```
+
+## `test` 브랜치 수정 후 원격에 반영하는 방법
+
+1. 파일 수정 (에디터로 코드 변경)
+2. 변경사항 확인
+```bash
+git status
+```
+3. 변경된 파일 스테이징
+```bash
+git add <파일경로>
+```
+4. 커밋 (버전으로 저장)
+```bash
+git commit -m "변경 내용 요약"
+```
+5. 원격에 처음 push할 때 (test 브랜치가 GitHub에 아직 없으므로 `-u`로 추적 연결까지 함께)
+```bash
+git push -u github test
+```
+   - 이후부터는 `-u` 없이 그냥 `git push`만 해도 됨 (추적 연결이 설정됐기 때문)
+
+6. GitHub에서 `test` 브랜치가 준비되면, 보통 `main`에 합치기 위해 **Pull Request**를 만듭니다 (GitHub 웹사이트에서 진행).
+
+**참고**: 현재 `origin`은 GitLab, `github`는 GitHub을 가리키므로 GitHub에 올리려면 반드시 `github`을 remote 이름으로 명시해야 합니다 (`git push github test`).

@@ -10,8 +10,8 @@ from app.services.notification_service import notify_llm_failure
 MAX_RETRIES = 3
 RETRY_DELAYS = [5, 15, 30]  # 재시도 간격 (초): 5초 → 15초 → 30초
 MODELS = ["claude-opus-5", "claude-sonnet-5"]  # Opus 실패 시 Sonnet 폴백
-# temperature 파라미터를 받지 않는 모델 (Opus 4.7부터 sampling 파라미터 제거됨)
-MODELS_WITHOUT_TEMPERATURE = {"claude-opus-5"}
+# temperature 파라미터를 받지 않는 모델 (Opus 4.7부터 sampling 파라미터 제거됨, Sonnet 5도 동일)
+MODELS_WITHOUT_TEMPERATURE = {"claude-opus-5", "claude-sonnet-5"}
 
 
 def _save_llm_decision_logs(candidates: list, decision_map: dict, market_analysis: str, vix_value: float = None):
@@ -174,14 +174,27 @@ def review_buy_candidates(candidates: list, vix_value: float = None) -> dict:
                 print(f"  LLM 호출 시도 {attempt + 1}/{MAX_RETRIES} (모델: {model})")
                 create_kwargs = {
                     "model": model,
-                    "max_tokens": 2000,
+                    # Opus 5/Sonnet 5는 기본적으로 adaptive thinking이 켜져 있고,
+                    # thinking + 답변 텍스트가 같은 max_tokens 예산을 공유한다.
+                    # effort를 낮춰 thinking 소비를 줄이고, max_tokens을 넉넉히 잡아
+                    # 답변 텍스트가 중간에 잘리지 않게 한다.
+                    "max_tokens": 16000,
+                    "output_config": {"effort": "low"},
                     "messages": [{"role": "user", "content": prompt}],
                 }
                 if model not in MODELS_WITHOUT_TEMPERATURE:
                     create_kwargs["temperature"] = 0
                 message = client.messages.create(**create_kwargs)
 
-                response_text = message.content[0].text.strip()
+                if message.stop_reason == "max_tokens":
+                    raise ValueError(f"max_tokens({create_kwargs['max_tokens']}) 도달로 응답이 잘렸습니다 (thinking 소비 과다 가능성)")
+
+                # extended thinking 모델(Opus 5 등)은 content[0]에 ThinkingBlock을 먼저 반환하므로
+                # 인덱스로 바로 접근하지 않고 type == "text"인 블록을 찾는다.
+                text_block = next((b for b in message.content if b.type == "text"), None)
+                if text_block is None:
+                    raise ValueError("LLM 응답에 텍스트 블록이 없습니다 (thinking만 반환됨)")
+                response_text = text_block.text.strip()
                 # JSON 파싱 (```json ... ``` 래핑 처리)
                 if response_text.startswith("```"):
                     response_text = response_text.split("```")[1]

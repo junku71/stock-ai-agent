@@ -51,9 +51,11 @@ class Settings(BaseSettings):
     KIS_CANO: str = Field(default="", description="계좌번호 앞 8자리")
     KIS_ACNT_PRDT_CD: str = Field(default="01", description="계좌번호 뒤 2자리")
 
-    ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
     # 실적 캘린더(EARNINGS_CALENDAR) 전용 키 — 감성분석 키와 분리하여 일일 호출 한도 충돌 방지
+    ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
     ALPHA_VANTAGE_API_KEY_EARNINGS: str = os.getenv("ALPHA_VANTAGE_API_KEY_EARNINGS", "")
+
+
     # Finnhub — Alpha Vantage 캘린더에 없는 종목(MU/COST/AVGO 등)의 실적일 보강용 (yfinance 429 대체)
     FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
