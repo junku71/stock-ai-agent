@@ -10,6 +10,7 @@ from app.services.kr import (
     kr_recommendation_service as recommend,
     kr_sentiment_service,
     naver_service,
+    slack_file_service,
     universe,
 )
 from app.utils.kr_scheduler import (
@@ -17,6 +18,7 @@ from app.utils.kr_scheduler import (
     run_analysis_now,
     run_auto_sell_now,
     run_buy_execution_now,
+    run_report_now,
     run_sell_review_now,
     start_kr_scheduler,
     stop_kr_scheduler,
@@ -287,7 +289,8 @@ def fear_gate_revoke(
 @router.post("/pipeline/analysis", summary="분석 파이프라인 즉시 실행")
 def run_analysis():
     """
-    Step 1 시장데이터 → 2 Kaggle ML → 3 기술지표+감성 → 4 LLM 검토 → 매수 큐 저장.
+    Step 1 시장데이터 → 2 Kaggle ML → 3 기술지표+감성 → 4 LLM 매도검토 →
+    5 LLM 매수검토+큐 저장 → 6 분석 리포트 PDF Slack 전송.
     백그라운드 실행이며 진행 상황은 Slack 과 로그로 확인합니다. (수 분~15분 소요)
     """
     run_analysis_now()
@@ -318,6 +321,41 @@ def execute_sell_review():
     """
     run_sell_review_now()
     return {"message": "보유 종목 LLM 매도검토를 백그라운드에서 시작했습니다"}
+
+
+# ══════════════════════════════════════════════════════════════════
+# 분석 리포트 (PDF → Slack)
+# ══════════════════════════════════════════════════════════════════
+
+@router.post("/report/send", summary="분석 리포트 PDF 재생성 + Slack 전송")
+def send_report():
+    """
+    직전 분석 파이프라인이 남긴 원자료로 리포트 PDF 를 다시 만들어 Slack 에 올립니다.
+    파이프라인을 아직 돌리지 않았거나 서버를 재기동했으면 원자료가 비어 있어
+    빈 리포트가 나오므로, 그때는 `/kr/pipeline/analysis` 를 먼저 실행하세요.
+    """
+    run_report_now()
+    return {"message": "분석 리포트 생성을 백그라운드에서 시작했습니다"}
+
+
+@router.get("/report/config", summary="리포트 설정 진단")
+def report_config():
+    """리포트 생성/업로드에 필요한 설정이 갖춰졌는지 확인합니다."""
+    return {
+        "enabled": settings.KR_REPORT_ENABLED,
+        "model": settings.KR_REPORT_MODEL,
+        "anthropic_key": bool(settings.ANTHROPIC_API_KEY),
+        "report_dir": settings.KR_REPORT_DIR,
+        "keep_days": settings.KR_REPORT_KEEP_DAYS,
+        "slack_bot_token": bool(settings.SLACK_BOT_TOKEN),
+        "slack_report_channel": settings.SLACK_REPORT_CHANNEL or None,
+        "slack_upload_ready": slack_file_service.is_configured(),
+        "slack_webhook": bool(settings.SLACK_WEBHOOK_URL),
+        "note": (
+            "slack_upload_ready 가 false 면 PDF 는 서버에만 저장되고 "
+            "Webhook 으로 요약과 경로만 통지됩니다."
+        ),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════

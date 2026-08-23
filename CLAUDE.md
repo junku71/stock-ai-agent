@@ -98,13 +98,17 @@ Scheduling: schedule, APScheduler
 - `kr_scoring.py` - cross-sectional z-score (+ 외국인·기관 수급 팩터)
 - `kr_recommendation_service.py` - 기술 지표 생성 / 매수 후보 / 매도 후보
 - `kr_llm_review_service.py` - LLM 최종 검토 (한국 시장 프롬프트, Fail-Close)
-- `kr_notification_service.py` - Slack 알림 (원화 포맷)
+- `kr_notification_service.py` - Slack 텍스트 알림 (원화 포맷)
+- `kr_report_service.py` - 분석 리포트: 매수 견적서 산출 + LLM 서술 + 전송 오케스트레이션
+- `kr_pdf_service.py` - 리포트 PDF 렌더러 (ReportLab, 한글 폰트 자동 탐색/CID 폴백)
+- `slack_file_service.py` - Slack 파일 업로드 (Bot Token 3단계 API — Webhook 은 첨부 불가)
 - `app/utils/kr_scheduler.py` - 2단계 파이프라인 + 매도 감시 + 주문 정합성
 - `app/api/routes/kr.py` - `/kr/*` 라우트
 
 ### 시간 구조 (KST)
 한국 증시는 15:30 에 닫혀 장 마감 후 주문이 불가하므로 **분석과 집행을 분리**한다.
 - **16:30 Phase A (분석)**: 시장데이터 → Kaggle ML → 기술지표+뉴스감성 → LLM 검토 → `kr_buy_queue` 저장
+  → 분석 리포트 PDF 생성 후 Slack 채널 업로드 (6단계, 실패해도 파이프라인은 성공 처리)
 - **09:05 Phase B (집행)**: 큐를 읽어 현재가 재조회 후 지정가 매수
 - **09:00~15:20 매도 감시**: 1분 주기 (동시호가 구간 제외)
 
@@ -115,6 +119,10 @@ Scheduling: schedule, APScheduler
 - 지정가는 반드시 `round_to_tick()` 통과 (호가단위 불일치 시 주문 거부).
 - 유니버스 교체 시 `universe.py` / `sql/kr/setup_kr.sql` 컬럼 /
   `kaggle_notebook_kr/predict_kr.py` 의 `TARGET_COLUMNS` 세 곳을 함께 고쳐야 한다.
+- 리포트(6단계)는 Fail-Open 이다. LLM/PDF/Slack 중 무엇이 실패해도 예외를 밖으로 던지지 않고
+  매매 결과에 영향을 주지 않는다 — 반대로 리포트를 매매 게이트로 쓰면 안 된다.
+- Phase A 각 단계는 `KrScheduler._artifacts` 에 원자료를 남긴다. 리포트가 이걸 그대로 쓰므로
+  단계 로직을 고칠 때 적재 코드를 같이 유지해야 한다 (LLM 판정 사유는 DB 로 복원 불가).
 
 ### 테이블
 `kr_economic_and_stock_data`, `kr_stock_recommendations`, `kr_stock_analysis_results`,
@@ -133,3 +141,8 @@ Scheduling: schedule, APScheduler
 `KR_INTRADAY_FEAR_REVIEW_THRESHOLD`(기본 40.0), `KR_INTRADAY_REVIEW_INTERVAL_HOURS`(기본 2) —
 매도전략(부분익절+샹들리에 트레일링, 교체매매, LLM 판단 품질 보강, 장중 추가 매도검토) 관련. 자세한
 설명은 `documents/20_국내주식_KOSPI30_설계.md` 6장 참조
+
+분석 리포트(6단계) 관련 — 설계는 같은 문서 6-5장 참조:
+`KR_REPORT_ENABLED`(기본 true), `KR_REPORT_MODEL`(기본 claude-opus-5),
+`KR_REPORT_DIR`(기본 `reports/kr`), `KR_REPORT_KEEP_DAYS`(기본 60),
+`SLACK_BOT_TOKEN`(xoxb-…, scope `files:write`), `SLACK_REPORT_CHANNEL`(채널 ID 권장)

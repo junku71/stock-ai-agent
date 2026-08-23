@@ -43,3 +43,6 @@ predict_colab.py
 
 # Claude Code
 .claude/
+
+# 국내 분석 리포트 PDF (KR_REPORT_DIR)
+reports/

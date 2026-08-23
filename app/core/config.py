@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     SLACK_WEBHOOK_URL: str = os.getenv("SLACK_WEBHOOK_URL", "")
     SLACK_NOTIFY_LEVEL: str = os.getenv("SLACK_NOTIFY_LEVEL", "info")
 
+    # Slack 파일 업로드 (PDF 리포트 첨부용).
+    #   Incoming Webhook 은 텍스트 전용이라 파일을 붙일 수 없다. PDF 를 채널에 올리려면
+    #   Bot Token(xoxb-…, scope: files:write / 채널명 해석 시 channels:read)이 따로 필요하다.
+    #   둘 중 하나라도 비어 있으면 PDF 는 로컬에만 저장되고 업로드는 조용히 생략된다.
+    SLACK_BOT_TOKEN: str = os.getenv("SLACK_BOT_TOKEN", "")
+    SLACK_REPORT_CHANNEL: str = os.getenv("SLACK_REPORT_CHANNEL", "")
+
     # ══════════════════════════════════════════════════════════════
     # 미국 트랙 포지션 사이징 (app/services/position_sizing.py 공유)
     # ══════════════════════════════════════════════════════════════
@@ -174,6 +181,16 @@ class Settings(BaseSettings):
     KR_INTRADAY_REVIEW_INTERVAL_HOURS: float = float(
         os.getenv("KR_INTRADAY_REVIEW_INTERVAL_HOURS", "2")
     )
+
+    # ── 분석 리포트 PDF (Phase A 종료 후 LLM 작성 → Slack 업로드) ──
+    #   파이프라인 결과(시장환경·후보·LLM 판단·매수 견적)를 Claude 가 리포트로 정리해
+    #   PDF 로 만들어 Slack 채널에 올린다. 실패해도 파이프라인 결과에는 영향이 없다.
+    KR_REPORT_ENABLED: bool = os.getenv("KR_REPORT_ENABLED", "true").lower() == "true"
+    KR_REPORT_MODEL: str = os.getenv("KR_REPORT_MODEL", "claude-opus-5")
+    # 리포트 PDF 저장 경로 (프로젝트 루트 기준 상대경로 허용)
+    KR_REPORT_DIR: str = os.getenv("KR_REPORT_DIR", "reports/kr")
+    # 이 일수보다 오래된 리포트 PDF 는 생성 시 자동 정리. 0 이면 정리하지 않음.
+    KR_REPORT_KEEP_DAYS: int = int(os.getenv("KR_REPORT_KEEP_DAYS", "60"))
 
     # 분석 파이프라인(장 마감 후) / 매수 집행(장 시작 후) 시각 — 모두 KST
     KR_ANALYSIS_TIME: str = os.getenv("KR_ANALYSIS_TIME", "16:30")

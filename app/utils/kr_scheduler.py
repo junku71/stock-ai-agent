@@ -13,6 +13,8 @@
         (손절/부분익절/샹들리에/기술신호개수/공포장 기계적 규칙과 무관하게 별도로 판단만 적재,
          실제 매도 주문은 다음 매도 감시 사이클에 집행된다)
      5) LLM 매수 최종 검토 → kr_buy_queue 에 '다음 개장일 매수 예약' 저장 + Slack 보고
+     6) 분석 리포트: 1~5 결과 + 매수 견적서를 LLM 이 리포트로 정리 → PDF → Slack 채널 업로드
+        (사람이 읽는 산출물이라 실패해도 파이프라인을 실패로 처리하지 않는다)
 
   Phase B — 집행 (평일 KR_EXECUTION_TIME, 기본 09:05 KST)
      큐를 읽어 현재가 재조회 → 수량 재계산 → 지정가 매수 주문
@@ -46,6 +48,7 @@ from app.services.kr import (
     kr_market_data_service,
     kr_notification_service as notify,
     kr_recommendation_service as recommend,
+    kr_report_service,
     kr_sentiment_service,
     universe,
 )
@@ -75,6 +78,10 @@ class KrScheduler:
             "analysis": threading.Lock(),
             "execution": threading.Lock(),
         }
+        # Phase A 각 단계가 남기는 원자료 — 마지막 Step(분석 리포트)에서 재조회 없이 쓴다.
+        # DB 를 다시 읽으면 같은 값을 두 번 계산하게 되고, LLM 판정처럼 응답에만 존재하는
+        # 정보(승인 사유·시장 코멘트)는 애초에 복원할 수 없다.
+        self._artifacts: dict = {}
 
     # ── 스레드 관리 ────────────────────────────────────────────
 
@@ -184,9 +191,10 @@ class KrScheduler:
 
     async def execute_analysis_pipeline(self, force: bool = False) -> dict:
         """
-        5단계 순차 실행. 1~3, 5(매수)는 실패 시 즉시 중단하고 Slack 장애 알림.
+        6단계 순차 실행. 1~3, 5(매수)는 실패 시 즉시 중단하고 Slack 장애 알림.
         4(보유종목 LLM 매도검토)는 실패해도 매수 파이프라인을 막지 않는다 — 기계적 손절/트레일링이
         이미 자금을 보호하고 있어 Fail-Close 가 "추가 매도 보류"만 의미하기 때문이다.
+        6(분석 리포트 PDF)은 매매 결정이 모두 끝난 뒤의 보고용이라 실패해도 무시한다.
 
         Args:
             force: True 면 휴장일 가드를 무시하고 실행 (수동 트리거용)
@@ -199,6 +207,7 @@ class KrScheduler:
         logger.info("===== 국내 분석 파이프라인 시작 =====")
         started = time.time()
         completed: dict = {}
+        self._artifacts = {}
 
         def _fail(key: str, name: str, error: str) -> dict:
             try:
@@ -216,21 +225,21 @@ class KrScheduler:
 
         # ── Step 1: 시장 데이터 ──────────────────────────────
         name, key = "시장 데이터 수집 (지수·환율·종목·거시)", "1_market_data"
-        logger.info(f"[1/5] {name}")
+        logger.info(f"[1/6] {name}")
         t0 = time.time()
         try:
             result = kr_market_data_service.collect_market_data()
             if not result.get("success"):
                 raise RuntimeError(result.get("message", "수집 실패"))
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[1/5] 완료 ({completed[key]['elapsed_sec']}초) — {result['message']}")
+            logger.info(f"[1/6] 완료 ({completed[key]['elapsed_sec']}초) — {result['message']}")
         except Exception as e:
-            logger.error(f"[1/5] 실패: {e}", exc_info=True)
+            logger.error(f"[1/6] 실패: {e}", exc_info=True)
             return _fail(key, name, str(e))
 
         # ── Step 2: Kaggle ML ────────────────────────────────
         name, key = "Kaggle ML 예측 (국내 커널)", "2_kaggle_ml"
-        logger.info(f"[2/5] {name}")
+        logger.info(f"[2/6] {name}")
         t0 = time.time()
         try:
             ok, msg, meta = ml_trigger_service.trigger_and_wait(
@@ -241,14 +250,14 @@ class KrScheduler:
             if not ok:
                 raise RuntimeError(f"Kaggle 실행 실패: {msg} (meta={meta})")
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[2/5] 완료 ({completed[key]['elapsed_sec']}초)")
+            logger.info(f"[2/6] 완료 ({completed[key]['elapsed_sec']}초)")
         except Exception as e:
-            logger.error(f"[2/5] 실패: {e}", exc_info=True)
+            logger.error(f"[2/6] 실패: {e}", exc_info=True)
             return _fail(key, name, str(e))
 
         # ── Step 3: 기술 지표 + 뉴스 감성 ────────────────────
         name, key = "기술적 지표 + 뉴스 감성 분석", "3_tech_sentiment"
-        logger.info(f"[3/5] {name}")
+        logger.info(f"[3/6] {name}")
         t0 = time.time()
         try:
             tech_result = recommend.generate_technical_recommendations()
@@ -270,9 +279,9 @@ class KrScheduler:
             logger.info(f"  뉴스 감성: {sent_result['message']}")
 
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[3/5] 완료 ({completed[key]['elapsed_sec']}초)")
+            logger.info(f"[3/6] 완료 ({completed[key]['elapsed_sec']}초)")
         except Exception as e:
-            logger.error(f"[3/5] 실패: {e}", exc_info=True)
+            logger.error(f"[3/6] 실패: {e}", exc_info=True)
             return _fail(key, name, str(e))
 
         try:
@@ -289,28 +298,48 @@ class KrScheduler:
 
         # ── Step 4: 보유 종목 LLM 매도검토 (실패해도 매수 파이프라인은 계속) ──
         name, key = "보유 종목 LLM 매도검토", "4_sell_review"
-        logger.info(f"[4/5] {name}")
+        logger.info(f"[4/6] {name}")
         t0 = time.time()
         try:
             sell_reviewed = self._build_sell_review()
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[4/5] 완료 ({completed[key]['elapsed_sec']}초) — 검토 {sell_reviewed}건")
+            logger.info(f"[4/6] 완료 ({completed[key]['elapsed_sec']}초) — 검토 {sell_reviewed}건")
         except Exception as e:
             # Fail-Close: 매도검토 자체가 실패해도 기계적 손절/트레일링이 자금을 보호하므로
             # 매수 파이프라인을 막을 이유가 없다. 경고만 남기고 계속 진행한다.
-            logger.error(f"[4/5] 실패(매수 파이프라인은 계속 진행): {e}", exc_info=True)
+            logger.error(f"[4/6] 실패(매수 파이프라인은 계속 진행): {e}", exc_info=True)
 
         # ── Step 5: LLM 매수 최종 검토 → 매수 큐 ─────────────
         name, key = "LLM 매수 최종 검토 + 매수 예약", "5_llm_queue"
-        logger.info(f"[5/5] {name}")
+        logger.info(f"[5/6] {name}")
         t0 = time.time()
         try:
             queued = self._build_buy_queue()
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[5/5] 완료 ({completed[key]['elapsed_sec']}초) — 예약 {len(queued)}건")
+            logger.info(f"[5/6] 완료 ({completed[key]['elapsed_sec']}초) — 예약 {len(queued)}건")
         except Exception as e:
-            logger.error(f"[5/5] 실패: {e}", exc_info=True)
+            logger.error(f"[5/6] 실패: {e}", exc_info=True)
             return _fail(key, name, str(e))
+
+        # ── Step 6: 분석 리포트 PDF → Slack ──────────────────
+        # 매매 결정은 Step 5 에서 이미 끝났다. 리포트는 사람이 읽는 산출물이라
+        # 실패해도 파이프라인을 실패로 처리하지 않는다 (경고만 남기고 계속).
+        name, key = "분석 리포트 PDF 생성 + Slack 전송", "6_report"
+        logger.info(f"[6/6] {name}")
+        t0 = time.time()
+        try:
+            self._artifacts["steps"] = {
+                k: v["elapsed_sec"] for k, v in completed.items()
+            }
+            report = kr_report_service.build_and_send_report(self._artifacts)
+            completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
+            logger.info(
+                f"[6/6] 완료 ({completed[key]['elapsed_sec']}초) — "
+                f"PDF {report.get('pdf_path')} / 업로드 {report.get('uploaded')}"
+            )
+        except Exception as e:
+            logger.error(f"[6/6] 실패(파이프라인은 정상 종료): {e}", exc_info=True)
+            report = {"success": False, "error": str(e)}
 
         total = int(time.time() - started)
         logger.info(f"===== 국내 분석 파이프라인 완료 (총 {total}초) =====")
@@ -319,6 +348,7 @@ class KrScheduler:
             "failed_step": None,
             "completed_steps": completed,
             "queued_count": len(queued),
+            "report": report,
             "total_elapsed_sec": total,
         }
 
@@ -336,6 +366,8 @@ class KrScheduler:
 
         if not holdings_context:
             logger.info(f"  매도검토 대상 없음: {context.get('message')}")
+            self._artifacts["sell_decisions"] = []
+            self._artifacts["sell_market_analysis"] = context.get("message")
             try:
                 notify.notify_llm_sell_decisions([], "", market, is_intraday=is_intraday)
             except Exception as e:
@@ -346,6 +378,8 @@ class KrScheduler:
         review = kr_llm_sell_review_service.review_sell_candidates(
             holdings_context, market, is_intraday=is_intraday
         )
+        self._artifacts["sell_decisions"] = review["decisions"]
+        self._artifacts["sell_market_analysis"] = review.get("market_analysis")
 
         try:
             notify.notify_llm_sell_decisions(
@@ -467,14 +501,18 @@ class KrScheduler:
         # 절감, 어차피 집행 단계(execute_buy_queue)에서도 다시 막힌다).
         if not market_switch_service.is_buy_enabled("KR"):
             logger.info("  국내 시장 매수 스위치 꺼짐 — 매수검토 스킵")
+            self._artifacts["llm_reasoning"] = "매수 원격 스위치가 꺼져 있어 매수검토를 건너뛰었습니다"
             self._replace_queue([])
             return []
         combined = recommend.get_buy_candidates()
         candidates = combined.get("results", [])
         market = combined.get("market", {})
+        self._artifacts["market"] = market
+        self._artifacts["all_candidates"] = candidates
 
         if not candidates:
             logger.info(f"  매수 후보 없음: {combined.get('message')}")
+            self._artifacts["llm_reasoning"] = combined.get("message")
             try:
                 notify.notify_llm_decisions([], [], combined.get("message", ""), market)
             except Exception as e:
@@ -492,6 +530,7 @@ class KrScheduler:
 
         if not candidates:
             logger.info("  보유 종목 제외 후 남은 후보 없음")
+            self._artifacts["llm_reasoning"] = "모든 후보가 이미 보유 중입니다"
             try:
                 notify.notify_llm_decisions([], [], "모든 후보가 이미 보유 중입니다", market)
             except Exception as e:
@@ -513,6 +552,8 @@ class KrScheduler:
 
         logger.info(f"  매수 후보 {len(candidates)}개 → LLM 최종 검토")
         review = kr_llm_review_service.review_buy_candidates(candidates, market)
+        self._artifacts["held"] = list(review["held_candidates"])
+        self._artifacts["llm_reasoning"] = review.get("llm_reasoning")
 
         try:
             notify.notify_llm_decisions(
@@ -543,6 +584,15 @@ class KrScheduler:
             approved = approved[:room]
 
         self._replace_queue(approved)
+        # 슬롯 제한으로 잘린 종목은 '승인됐지만 오늘은 못 사는' 상태 — 리포트에서
+        # 보류 목록에 포함시켜야 운용자가 이유를 알 수 있다.
+        for c in review["reviewed_candidates"][len(approved):]:
+            c["llm_reason"] = (
+                f"{c.get('llm_reason', '')} (보유 한도 {settings.KR_MAX_POSITIONS}종목 "
+                f"초과로 이번 회차 예약 제외)"
+            ).strip()
+            self._artifacts.setdefault("held", []).append(c)
+        self._artifacts["approved"] = approved
 
         try:
             notify.notify_buy_queued(approved, settings.KR_EXECUTION_TIME)
@@ -1514,6 +1564,25 @@ def run_buy_execution_now(force: bool = False) -> bool:
 def run_auto_sell_now() -> bool:
     """매도 판단 즉시 실행."""
     return _run_in_thread(lambda: kr_scheduler.execute_auto_sell())
+
+
+def run_report_now() -> bool:
+    """
+    직전 분석 파이프라인의 원자료로 리포트만 다시 만들어 보낸다 (수동 재발송용).
+
+    LLM 호출 + PDF 생성이라 수십 초가 걸려 별도 스레드에서 돌린다. 서버 재기동 등으로
+    원자료가 비어 있으면 매수 예약이 없는 리포트가 나오므로, 그때는 분석 파이프라인을
+    다시 돌리는 편이 맞다.
+    """
+
+    def _runner():
+        try:
+            kr_report_service.build_and_send_report(kr_scheduler._artifacts)
+        except Exception as e:
+            logger.error(f"수동 리포트 생성 실패: {e}", exc_info=True)
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return True
 
 
 def run_sell_review_now() -> bool:

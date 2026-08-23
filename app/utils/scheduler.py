@@ -515,13 +515,6 @@ class StockScheduler:
         Args:
             force: True 면 시간/중복 체크 우회 (통합 파이프라인에서 즉시 실행 시 사용)
         """
-        # 매수 원격 스위치 — force 여부와 무관하게 무조건 체크한다("꺼지면 다시 켤 때까지
-        # 계속 꺼짐"이 요구사항이라, 강제 트리거가 이 스위치를 우회하면 안 된다). 매도/정합성
-        # 확인은 이 스위치와 무관하게 별도로 계속 돈다.
-        if not market_switch_service.is_buy_enabled("US"):
-            logger.info("미국 시장 매수 스위치 꺼짐 — 자동 매수 스킵")
-            return
-
         # 뉴욕 시간 확인 (서머타임 자동 고려)
         now_in_ny = datetime.now(pytz.timezone('America/New_York'))
         ny_hour = now_in_ny.hour
@@ -540,6 +533,22 @@ class StockScheduler:
             # 당일 이미 매수 실행했으면 스킵
             if self._last_buy_date == ny_date:
                 return
+
+        # 매수 원격 스위치 — force 여부와 무관하게 무조건 체크한다("꺼지면 다시 켤 때까지
+        # 계속 꺼짐"이 요구사항이라, 강제 트리거가 이 스위치를 우회하면 안 된다). 매도/정합성
+        # 확인은 이 스위치와 무관하게 별도로 계속 돈다.
+        #
+        # 시간창 체크 '뒤'에 두는 이유: 이 잡은 5분마다 돌지만 실제 매수 시도는 하루 한 번
+        # 10:30~10:35 ET 뿐이다. 앞에 두면 스위치가 꺼져 있는 동안 24시간 내내 5분마다
+        # 스킵 로그가 찍혀(하루 288줄) 정작 봐야 할 로그를 덮는다. 여기에 두면 "매수했어야
+        # 할 시각에 스위치 때문에 걸렀다"는, 실제로 기록할 가치가 있는 순간만 남는다.
+        # force=True(수동 트리거)는 시간창을 건너뛰고 바로 여기에 도달하므로 차단은 그대로다.
+        if not market_switch_service.is_buy_enabled("US"):
+            logger.info(
+                f"미국 시장 매수 스위치 꺼짐 — 자동 매수 스킵 "
+                f"(force={force}, 뉴욕: {now_in_ny:%Y-%m-%d %H:%M:%S})"
+            )
+            return
 
         logger.info(
             f"자동 매수 작업 시작 (force={force}, 뉴욕: {now_in_ny.strftime('%Y-%m-%d %H:%M:%S')})"

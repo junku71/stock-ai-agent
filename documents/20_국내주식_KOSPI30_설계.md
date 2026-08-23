@@ -126,6 +126,7 @@ NAVER API Hub  -> 뉴스 원문 + 검색 트렌드
                                               3 기술지표+뉴스감성                -> 수량 재계산
                                               4 보유종목 LLM 매도검토 -> 로그    -> 지정가 매수
                                               5 LLM 매수검토 -> 큐 저장
+                                              6 분석 리포트 PDF -> Slack
 ```
 
 - **동시호가(15:20~15:30)** 는 지정가 주문의 체결 성격이 달라 매도 감시 창에서 제외한다.
@@ -331,6 +332,56 @@ LLM 판정은 `skipped` 처리되고 중복 매도되지 않는다.
 
 ---
 
+## 6-5. 분석 리포트 (Phase A 6단계)
+
+Slack 텍스트 알림은 "무엇을 샀다/판다"는 결과만 전한다. 운용자가 다음 영업일 아침에
+**판단 근거까지 한 장으로** 훑을 수 있게, Phase A 마지막에 리포트 PDF 를 만들어 채널에 올린다.
+
+```
+Step 1~5 결과 (스케줄러 _artifacts 에 누적)
+   ├─ 시장환경 / 채점 통과 후보 전체 / LLM 매수판정(승인·보류 + 사유)
+   └─ 보유종목 LLM 매도판정
+        ↓
+kr_report_service.build_buy_quote()      매수 견적서 (Phase B 와 동일한 배분 로직)
+        ↓
+kr_report_service.generate_narrative()   Claude — structured outputs 로 서술 JSON 강제
+        ↓
+kr_pdf_service.build_report_pdf()        A4 PDF (표지·시장진단·견적서·종목논거·매도검토·리스크·부록)
+        ↓
+slack_file_service.upload_file()         Bot Token 3단계 업로드 + 요약 코멘트
+```
+
+**설계 원칙 — 리포트는 매매에 영향을 주지 않는다.**
+
+| 실패 지점 | 동작 |
+|-----------|------|
+| LLM 서술 생성 실패 | 기계적 데이터만으로 PDF 생성 (Fail-Open). 표지에 실패 사유를 명시한다 |
+| PDF 생성 실패 | Webhook 으로 실패만 알리고 파이프라인은 성공으로 종료 |
+| Slack Bot Token 미설정 | PDF 는 서버에 저장하고 Webhook 으로 요약 + 저장 경로만 통지 |
+| Step 6 전체 예외 | 로그만 남기고 파이프라인 결과(`success: True`)는 유지 |
+
+매수·매도 결정은 Step 5 에서 이미 끝났고 리포트는 사람이 읽는 산출물이라, Fail-Close 를
+적용할 이유가 없다.
+
+**왜 원자료를 스케줄러에 들고 다니는가** — Step 6 에서 DB 를 다시 읽으면 같은 값을 두 번
+계산하게 되고, LLM 판정 사유·시장 코멘트처럼 **응답에만 존재하고 어디에도 그대로 남지 않는
+정보**는 애초에 복원할 수 없다. 그래서 각 단계가 `KrScheduler._artifacts` 에 결과를 남긴다.
+
+**매수 견적서의 수량은 참고치다.** Phase B(09:05)가 현재가를 재조회해 다시 계산하므로,
+견적서는 같은 배분 로직(`compute_weighted_slots`)에 **분석 시점 최신 체결가**를 넣은 값이다.
+집행 시각까지 가격이 움직이면 수량은 달라진다.
+
+**Slack 파일 업로드** — Incoming Webhook 은 텍스트 전용이라 파일을 붙일 수 없다.
+Bot Token(`files:write`)으로 `files.getUploadURLExternal` → 업로드 → `files.completeUploadExternal`
+3단계를 거친다(구 `files.upload` 는 2025-03 폐지). `SLACK_REPORT_CHANNEL` 은 채널 ID(`C…`) 권장이며,
+`#채널명` 으로 주면 `conversations.list` 로 1회 해석 후 캐시한다(`channels:read` 필요).
+
+**한글 폰트** — Windows 맑은고딕 / Linux 나눔고딕·Noto CJK 를 순서대로 찾고, 서버에 폰트 파일이
+없으면 ReportLab 내장 CID 폰트(HYSMyeongJo-Medium)로 폴백한다. 배포 환경에 폰트를 깔지 않아도
+글자가 깨지지 않는다.
+
+---
+
 ## 7. 파일 구조
 
 ```
@@ -345,7 +396,10 @@ app/services/kr/
   kr_recommendation_service.py 기술지표 생성 / 매수 후보 / 점수 유니버스 / 기계적 매도 후보 / LLM 매도검토 컨텍스트
   kr_llm_review_service.py     LLM 매수 최종 검토 (한국 시장 프롬프트, Fail-Close = 매수 차단)
   kr_llm_sell_review_service.py LLM 보유종목 매도검토 (점수감쇠/팩터반전/교체매매, Fail-Close = HOLD)
-  kr_notification_service.py   Slack (원화 포맷)
+  kr_notification_service.py   Slack 텍스트 알림 (원화 포맷)
+  kr_report_service.py         분석 리포트: 매수 견적서 산출 + LLM 서술 생성 + 전송 오케스트레이션
+  kr_pdf_service.py            리포트 PDF 렌더러 (ReportLab, 한글 폰트 자동 탐색)
+  slack_file_service.py        Slack 파일 업로드 (Bot Token 3단계 API — Webhook 은 첨부 불가)
 app/utils/kr_scheduler.py      2단계 파이프라인 + 매도 감시(기계적+LLM 판정 집행) + 정합성
 app/api/routes/kr.py           /kr/* 라우트
 sql/kr/setup_kr.sql            전체 스키마 (테이블 10개 + 컬럼 마이그레이션 + RLS/권한, 멱등)
@@ -395,6 +449,8 @@ kaggle_notebook_kr/            국내 전용 ML 커널 (predict_kr.py)
    POST /kr/pipeline/execute-sell-review  보유종목 LLM 매도검토만 즉시 실행
    POST /kr/pipeline/execute-buy    매수 집행 (드라이런이면 로그만)
    POST /kr/pipeline/execute-sell   매도 감시 즉시 실행 (기계적 규칙 + LLM 판정 집행)
+   GET  /kr/report/config           리포트 설정 진단 (LLM 키 / Slack 업로드 준비 여부)
+   POST /kr/report/send             직전 파이프라인 결과로 리포트 재생성 + 전송
    ```
 
 6. **모의투자 전환** — `KR_DRY_RUN=false`, `KIS_USE_MOCK=true`
