@@ -9,13 +9,17 @@
      1) 시장 데이터 수집 (지수/환율/글로벌/30종목 종가/ECOS)
      2) Kaggle ML 예측 (국내 전용 커널)
      3) 기술적 지표 + 네이버 뉴스 감성 + 수급
-     4) LLM 최종 검토 → kr_buy_queue 에 '다음 개장일 매수 예약' 저장 + Slack 보고
+     4) 보유 종목 LLM 매도검토 → kr_llm_sell_decision_logs 에 HOLD/SELL_ALL/SELL_PARTIAL 저장 + Slack 보고
+        (손절/부분익절/샹들리에/기술신호개수/공포장 기계적 규칙과 무관하게 별도로 판단만 적재,
+         실제 매도 주문은 다음 매도 감시 사이클에 집행된다)
+     5) LLM 매수 최종 검토 → kr_buy_queue 에 '다음 개장일 매수 예약' 저장 + Slack 보고
 
   Phase B — 집행 (평일 KR_EXECUTION_TIME, 기본 09:05 KST)
      큐를 읽어 현재가 재조회 → 수량 재계산 → 지정가 매수 주문
 
   매도 감시 — 1분마다, 09:00~15:20 KST
-     ATR 익절/손절 + 기술적 매도 신호 + 공포장 조건
+     기계적 규칙(ATR 손절 / 부분익절+샹들리에 트레일링 / 기술적 매도 신호 / 공포장 조건, 항상 LLM
+     무관하게 실행) ∪ 전날 16:30 LLM 매도검토에서 나온 미집행 SELL_ALL/SELL_PARTIAL 판정을 집행한다.
      동시에 KIS 원장과 kr_trade_records 정합성을 맞춘다 (체결 확인 / 미체결 정리)
 
 전역 schedule 큐를 미국 트랙과 공유하면 두 스레드가 run_pending() 을 동시에 돌려
@@ -26,18 +30,19 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pytz
 import schedule
 
 from app.core.config import settings
 from app.db.supabase import supabase
-from app.services import ml_trigger_service
+from app.services import market_switch_service, ml_trigger_service
 from app.services.position_sizing import compute_weighted_slots, describe_allocation
 from app.services.kr import (
     kis_domestic_service as kis,
     kr_llm_review_service,
+    kr_llm_sell_review_service,
     kr_market_data_service,
     kr_notification_service as notify,
     kr_recommendation_service as recommend,
@@ -51,6 +56,7 @@ KST = pytz.timezone("Asia/Seoul")
 
 TABLE_QUEUE = "kr_buy_queue"
 TABLE_TRADES = "kr_trade_records"
+TABLE_SELL_LOGS = "kr_llm_sell_decision_logs"
 
 # 큐에 남은 예약은 2일이 지나면 만료시킨다 (연휴 등으로 집행이 밀린 경우 낡은 판단으로 사지 않도록)
 QUEUE_MAX_AGE_DAYS = 2
@@ -178,7 +184,9 @@ class KrScheduler:
 
     async def execute_analysis_pipeline(self, force: bool = False) -> dict:
         """
-        4단계 순차 실행. 실패 시 즉시 중단하고 Slack 장애 알림.
+        5단계 순차 실행. 1~3, 5(매수)는 실패 시 즉시 중단하고 Slack 장애 알림.
+        4(보유종목 LLM 매도검토)는 실패해도 매수 파이프라인을 막지 않는다 — 기계적 손절/트레일링이
+        이미 자금을 보호하고 있어 Fail-Close 가 "추가 매도 보류"만 의미하기 때문이다.
 
         Args:
             force: True 면 휴장일 가드를 무시하고 실행 (수동 트리거용)
@@ -208,21 +216,21 @@ class KrScheduler:
 
         # ── Step 1: 시장 데이터 ──────────────────────────────
         name, key = "시장 데이터 수집 (지수·환율·종목·거시)", "1_market_data"
-        logger.info(f"[1/4] {name}")
+        logger.info(f"[1/5] {name}")
         t0 = time.time()
         try:
             result = kr_market_data_service.collect_market_data()
             if not result.get("success"):
                 raise RuntimeError(result.get("message", "수집 실패"))
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[1/4] 완료 ({completed[key]['elapsed_sec']}초) — {result['message']}")
+            logger.info(f"[1/5] 완료 ({completed[key]['elapsed_sec']}초) — {result['message']}")
         except Exception as e:
-            logger.error(f"[1/4] 실패: {e}", exc_info=True)
+            logger.error(f"[1/5] 실패: {e}", exc_info=True)
             return _fail(key, name, str(e))
 
         # ── Step 2: Kaggle ML ────────────────────────────────
         name, key = "Kaggle ML 예측 (국내 커널)", "2_kaggle_ml"
-        logger.info(f"[2/4] {name}")
+        logger.info(f"[2/5] {name}")
         t0 = time.time()
         try:
             ok, msg, meta = ml_trigger_service.trigger_and_wait(
@@ -233,14 +241,14 @@ class KrScheduler:
             if not ok:
                 raise RuntimeError(f"Kaggle 실행 실패: {msg} (meta={meta})")
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[2/4] 완료 ({completed[key]['elapsed_sec']}초)")
+            logger.info(f"[2/5] 완료 ({completed[key]['elapsed_sec']}초)")
         except Exception as e:
-            logger.error(f"[2/4] 실패: {e}", exc_info=True)
+            logger.error(f"[2/5] 실패: {e}", exc_info=True)
             return _fail(key, name, str(e))
 
         # ── Step 3: 기술 지표 + 뉴스 감성 ────────────────────
         name, key = "기술적 지표 + 뉴스 감성 분석", "3_tech_sentiment"
-        logger.info(f"[3/4] {name}")
+        logger.info(f"[3/5] {name}")
         t0 = time.time()
         try:
             tech_result = recommend.generate_technical_recommendations()
@@ -262,9 +270,9 @@ class KrScheduler:
             logger.info(f"  뉴스 감성: {sent_result['message']}")
 
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[3/4] 완료 ({completed[key]['elapsed_sec']}초)")
+            logger.info(f"[3/5] 완료 ({completed[key]['elapsed_sec']}초)")
         except Exception as e:
-            logger.error(f"[3/4] 실패: {e}", exc_info=True)
+            logger.error(f"[3/5] 실패: {e}", exc_info=True)
             return _fail(key, name, str(e))
 
         try:
@@ -279,16 +287,29 @@ class KrScheduler:
         except Exception as e:
             logger.warning(f"데이터 완료 알림 발송 실패: {e}")
 
-        # ── Step 4: LLM 검토 → 매수 큐 ───────────────────────
-        name, key = "LLM 최종 검토 + 매수 예약", "4_llm_queue"
-        logger.info(f"[4/4] {name}")
+        # ── Step 4: 보유 종목 LLM 매도검토 (실패해도 매수 파이프라인은 계속) ──
+        name, key = "보유 종목 LLM 매도검토", "4_sell_review"
+        logger.info(f"[4/5] {name}")
+        t0 = time.time()
+        try:
+            sell_reviewed = self._build_sell_review()
+            completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
+            logger.info(f"[4/5] 완료 ({completed[key]['elapsed_sec']}초) — 검토 {sell_reviewed}건")
+        except Exception as e:
+            # Fail-Close: 매도검토 자체가 실패해도 기계적 손절/트레일링이 자금을 보호하므로
+            # 매수 파이프라인을 막을 이유가 없다. 경고만 남기고 계속 진행한다.
+            logger.error(f"[4/5] 실패(매수 파이프라인은 계속 진행): {e}", exc_info=True)
+
+        # ── Step 5: LLM 매수 최종 검토 → 매수 큐 ─────────────
+        name, key = "LLM 매수 최종 검토 + 매수 예약", "5_llm_queue"
+        logger.info(f"[5/5] {name}")
         t0 = time.time()
         try:
             queued = self._build_buy_queue()
             completed[key] = {"step_name": name, "elapsed_sec": int(time.time() - t0)}
-            logger.info(f"[4/4] 완료 ({completed[key]['elapsed_sec']}초) — 예약 {len(queued)}건")
+            logger.info(f"[5/5] 완료 ({completed[key]['elapsed_sec']}초) — 예약 {len(queued)}건")
         except Exception as e:
-            logger.error(f"[4/4] 실패: {e}", exc_info=True)
+            logger.error(f"[5/5] 실패: {e}", exc_info=True)
             return _fail(key, name, str(e))
 
         total = int(time.time() - started)
@@ -301,8 +322,153 @@ class KrScheduler:
             "total_elapsed_sec": total,
         }
 
+    def _build_sell_review(self, is_intraday: bool = False) -> int:
+        """
+        보유 종목 LLM 매도검토 → kr_llm_sell_decision_logs 저장 → Slack 보고. 반환값: 검토 종목 수.
+
+        is_intraday=True 면 정기(16:30) 검토가 아니라 장중 추가 재점검이다 — 결정_date 는
+        오늘 날짜로 동일하게 저장되므로, 이 사이클 이후 매도 감시 루프에서 바로 집행 대상이 될
+        수 있다(정기 검토는 장 마감 후라 다음날에야 집행되는 것과 다르다).
+        """
+        context = recommend.get_llm_sell_context()
+        holdings_context = context.get("holdings", [])
+        market = context.get("market", {})
+
+        if not holdings_context:
+            logger.info(f"  매도검토 대상 없음: {context.get('message')}")
+            try:
+                notify.notify_llm_sell_decisions([], "", market, is_intraday=is_intraday)
+            except Exception as e:
+                logger.warning(f"  '검토 대상 없음' 알림 발송 실패: {e}")
+            return 0
+
+        logger.info(f"  보유 종목 {len(holdings_context)}개 → LLM 매도검토{'(장중 재점검)' if is_intraday else ''}")
+        review = kr_llm_sell_review_service.review_sell_candidates(
+            holdings_context, market, is_intraday=is_intraday
+        )
+
+        try:
+            notify.notify_llm_sell_decisions(
+                review["decisions"], review.get("market_analysis", ""), market, is_intraday=is_intraday
+            )
+        except Exception as e:
+            logger.warning(f"  LLM 매도검토 알림 발송 실패: {e}")
+
+        return len(holdings_context)
+
+    def _get_last_sell_review_at(self) -> Optional[datetime]:
+        """
+        가장 최근 매도검토(정기든 장중 재점검이든) 실행 시각. kr_llm_sell_decision_logs 는
+        이제 append-only 라 실행할 때마다 새 행이 남으므로, 그 최신 created_at 을 그대로
+        쿨다운 기준으로 쓴다 — 스케줄러 메모리 대신 DB 에서 복구하므로 서버가 재시작돼도
+        직전 실행 시각을 그대로 안다(재시작 직후 스팸성 재실행이 나지 않는다).
+        """
+        try:
+            resp = (
+                supabase.table(TABLE_SELL_LOGS)
+                .select("created_at")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data or []
+        except Exception as e:
+            logger.warning(f"  마지막 매도검토 시각 조회 실패: {e}")
+            return None
+        if not rows:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(rows[0]["created_at"]).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = KST.localize(dt)
+            return dt.astimezone(KST)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"  마지막 매도검토 시각 파싱 실패: {e}")
+            return None
+
+    def _maybe_run_intraday_sell_review(self, now: datetime):
+        """
+        조건부 주기체크: 공포지수가 KR_INTRADAY_FEAR_REVIEW_THRESHOLD 를 넘는 날은, 마지막
+        매도검토 이후 KR_INTRADAY_REVIEW_INTERVAL_HOURS 시간마다 LLM 매도검토를 한 번 더 돌린다.
+
+        공포지수(kospi_vol_20d)는 Phase A(16:30)에만 갱신되므로 장중에는 하루 종일 고정값이다
+        — "장중에 막 넘어선 순간"을 관측할 수 없어 이벤트 트리거 대신 주기체크로 설계했다.
+        """
+        threshold = settings.KR_INTRADAY_FEAR_REVIEW_THRESHOLD
+        if threshold <= 0:
+            return
+        try:
+            fear_index = kr_market_data_service.get_market_context().get("kospi_vol_20d")
+        except Exception as e:
+            logger.warning(f"  장중 매도검토 트리거용 시장환경 조회 실패: {e}")
+            return
+        if fear_index is None or fear_index <= threshold:
+            return
+
+        last_review_at = self._get_last_sell_review_at()
+        if last_review_at is not None:
+            elapsed_hours = (now - last_review_at).total_seconds() / 3600
+            if elapsed_hours < settings.KR_INTRADAY_REVIEW_INTERVAL_HOURS:
+                return
+
+        logger.info(
+            f"  공포지수 {fear_index:.1f}% > {threshold:.0f}% 지속 — 장중 매도검토 실행 "
+            f"(주기 {settings.KR_INTRADAY_REVIEW_INTERVAL_HOURS}시간)"
+        )
+        try:
+            self._build_sell_review(is_intraday=True)
+        except Exception as e:
+            logger.error(f"  장중 매도검토 실패: {e}", exc_info=True)
+
+    def _latest_sell_decisions_today(self) -> Dict[str, dict]:
+        """
+        오늘자 kr_llm_sell_decision_logs 를 코드별 가장 최신(created_at) 행만 남겨 반환한다.
+
+        이 테이블은 append-only 다(장중 추가 매도검토가 같은 날 여러 번 쌓일 수 있음) — 그래서
+        "오늘의 유효 판단"은 항상 코드별 최신 행이어야 하고, 이 함수를 거치지 않고 status/decision
+        으로만 단순 필터링하면 이미 새 판단으로 대체된 낡은 행까지 잘못 집어올 수 있다.
+        """
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        try:
+            resp = (
+                supabase.table(TABLE_SELL_LOGS)
+                .select("*")
+                .eq("decision_date", today)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            all_rows = resp.data or []
+        except Exception as e:
+            logger.warning(f"  오늘자 매도판정 조회 실패: {e}")
+            return {}
+
+        latest: Dict[str, dict] = {}
+        for r in all_rows:  # created_at desc 라 코드별 첫 등장이 최신
+            code = r.get("code")
+            if code and code not in latest:
+                latest[code] = r
+        return latest
+
+    def _pending_rotation_sells(self) -> int:
+        """오늘자 LLM 매도검토(코드별 최신 판단 기준)에서 SELL_ALL 이고 아직 집행 전인 종목 수."""
+        try:
+            latest = self._latest_sell_decisions_today()
+            return sum(
+                1 for r in latest.values()
+                if r.get("decision") == "SELL_ALL" and r.get("status") == "pending"
+            )
+        except Exception as e:
+            logger.warning(f"  교체매매 대기 조회 실패(room 보정 생략): {e}")
+            return 0
+
     def _build_buy_queue(self) -> List[dict]:
         """매수 후보 산출 → LLM 검토 → kr_buy_queue 저장 → Slack 보고."""
+        # 매수 원격 스위치 — 꺼져 있으면 LLM 매수검토 자체를 돌리지 않는다(Anthropic 비용
+        # 절감, 어차피 집행 단계(execute_buy_queue)에서도 다시 막힌다).
+        if not market_switch_service.is_buy_enabled("KR"):
+            logger.info("  국내 시장 매수 스위치 꺼짐 — 매수검토 스킵")
+            self._replace_queue([])
+            return []
         combined = recommend.get_buy_candidates()
         candidates = combined.get("results", [])
         market = combined.get("market", {})
@@ -360,9 +526,15 @@ class KrScheduler:
 
         approved = review["reviewed_candidates"]
 
-        # 슬롯 제한 — 최대 보유 종목 수를 넘지 않게 상위 점수만
+        # 슬롯 제한 — 최대 보유 종목 수를 넘지 않게 상위 점수만.
+        # 오늘 LLM 매도검토에서 SELL_ALL 판정을 받은 종목(교체매매)은 아직 집행 전이어도
+        # room 계산에서 미리 빼준다 — 그래야 같은 날 교체매매 매수가 큐에 들어갈 수 있다.
+        # 실집행은 어차피 현금 기준으로 자연 축소되므로(T+2 결제라 당일 매도대금은 못 쓴다)
+        # 별도 동기화 장치는 두지 않는다 — 드물게 포지션 수가 일시 초과돼도 다음 매도 감시
+        # 사이클에서 자기교정된다.
         current_positions = len(held)
-        room = max(settings.KR_MAX_POSITIONS - current_positions, 0)
+        rotating_out = self._pending_rotation_sells()
+        room = max(settings.KR_MAX_POSITIONS - (current_positions - rotating_out), 0)
         if len(approved) > room:
             logger.info(
                 f"  보유 한도({settings.KR_MAX_POSITIONS}) 적용: "
@@ -448,6 +620,12 @@ class KrScheduler:
         kr_buy_queue 의 pending 예약을 장 시작 후 집행한다.
         분석 시점 종가가 아니라 집행 시점 현재가로 수량을 다시 계산한다.
         """
+        # 매수 원격 스위치 — force 여부와 무관하게 무조건 체크한다("꺼지면 다시 켤 때까지
+        # 계속 꺼짐"이 요구사항). 매도 감시/정합성 확인은 이 스위치와 무관하게 별도로 돈다.
+        if not market_switch_service.is_buy_enabled("KR"):
+            logger.info("국내 시장 매수 스위치 꺼짐 — 매수 집행 스킵")
+            return {"success": True, "skipped": "buy_disabled", "ordered": 0}
+
         now = datetime.now(KST)
         if not force:
             if not kis.is_business_day(now):
@@ -703,17 +881,20 @@ class KrScheduler:
         if not kis.is_sell_window(now):
             return {"skipped": "outside_sell_window"}
 
-        result = recommend.get_sell_candidates(balance=balance)
-        candidates = result.get("sell_candidates", [])
-        if not candidates:
-            return {"sold": 0}
+        # ── 공포장 지속 시 장중 추가 매도검토 (조건부 주기체크) ──
+        self._maybe_run_intraday_sell_review(now)
 
-        # 이미 매도 주문이 나간 종목 제외
+        # ── 기계적 규칙 (ATR 손절/부분익절+샹들리에/기술신호개수/공포장) — 항상 LLM 과 무관하게 실행 ──
+        result = recommend.get_mechanical_sell_candidates(balance=balance)
+        self._apply_trailing_updates(result.get("trailing_updates", []))
+        candidates = result.get("sell_candidates", [])
+
+        # 이미 매도/부분매도 주문이 나간 종목 제외
         try:
             resp = (
                 supabase.table(TABLE_TRADES)
                 .select("code")
-                .eq("status", "sell_ordered")
+                .in_("status", ["sell_ordered", "partial_sell_ordered"])
                 .eq("account_type", kis.current_account_type())
                 .execute()
             )
@@ -726,16 +907,22 @@ class KrScheduler:
         except Exception as e:
             logger.warning(f"  매도 중복 확인 실패: {e}")
 
-        if not candidates:
-            return {"sold": 0}
-
-        logger.info(f"매도 대상 {len(candidates)}개 식별")
         sold = 0
+        account = kis.current_account_type()
+
+        if candidates:
+            logger.info(f"매도 대상 {len(candidates)}개 식별(기계적)")
 
         for c in candidates:
-            code, name, qty = c["code"], c["stock_name"], c["quantity"]
+            code, name = c["code"], c["stock_name"]
+            qty = c["quantity"]
+            exit_type = c.get("exit_type", "full")
+            reason_code = c.get("reason_code", "signal")
             try:
-                logger.info(f"  {name}({code}) 매도 근거: {'; '.join(c['sell_reasons'])}")
+                logger.info(
+                    f"  {name}({code}) {'부분' if exit_type == 'partial' else '전량'}매도 근거: "
+                    f"{'; '.join(c['sell_reasons'])}"
+                )
 
                 current = kis.get_current_price_value(code)
                 if current is None:
@@ -745,57 +932,287 @@ class KrScheduler:
                 # 매도 지정가: 호가단위로 내림 (체결 확률 우선)
                 order_price = kis.round_to_tick(current, mode="down")
 
-                reason = "signal"
-                for r in c["sell_reasons"]:
-                    if "익절" in r:
-                        reason = "take_profit"
-                        break
-                    if "손절" in r:
-                        reason = "stop_loss"
-                        break
-                    if "패닉셀" in r:
-                        reason = "panic_sell"
-                        break
-                    if "순매도" in r:
-                        reason = "flow_out"
-                        break
-
                 result_order = kis.order_stock(code, qty, order_price, is_buy=False)
                 if result_order.get("rt_cd") != "0":
                     continue
 
                 sold += 1
                 buy_price = c.get("buy_price") or 0
-                pnl = (order_price - buy_price) * qty if buy_price > 0 else None
-                pnl_pct = (
-                    (order_price - buy_price) / buy_price * 100 if buy_price > 0 else None
+                trade_id = c.get("trade_id")
+
+                if exit_type == "partial":
+                    try:
+                        self._update_trade_record(
+                            {"status": "partial_sell_ordered", "pending_partial_qty": qty},
+                            trade_id=trade_id,
+                            code=code,
+                            account=account,
+                        )
+                    except Exception as e:
+                        logger.error(f"  {name}({code}) 거래기록 갱신 실패: {e}")
+
+                    try:
+                        notify.notify_sell_ordered(
+                            code, name, qty, order_price, reason_code, is_partial=True
+                        )
+                    except Exception as e:
+                        logger.warning(f"  부분매도 주문 알림 발송 실패: {e}")
+                else:
+                    pnl_leg = (order_price - buy_price) * qty if buy_price > 0 else None
+                    realized_pnl = c.get("realized_partial_pnl") or 0.0
+                    realized_qty = c.get("realized_partial_qty") or 0
+                    total_qty = qty + realized_qty
+                    pnl_total = (pnl_leg or 0) + realized_pnl if buy_price > 0 else None
+                    pnl_pct_total = (
+                        (pnl_total / (buy_price * total_qty) * 100)
+                        if buy_price > 0 and total_qty > 0
+                        else None
+                    )
+
+                    try:
+                        self._update_trade_record(
+                            {
+                                "status": "sell_ordered",
+                                "sell_price": order_price,
+                                "sell_date": datetime.now(KST).isoformat(),
+                                "sell_reason": reason_code,
+                                "profit_loss": round(pnl_total, 0) if pnl_total is not None else None,
+                                "profit_loss_pct": (
+                                    round(pnl_pct_total, 2) if pnl_pct_total is not None else None
+                                ),
+                            },
+                            trade_id=trade_id,
+                            code=code,
+                            account=account,
+                        )
+                    except Exception as e:
+                        logger.error(f"  {name}({code}) 거래기록 갱신 실패: {e}")
+
+                    try:
+                        notify.notify_sell_ordered(code, name, qty, order_price, reason_code)
+                    except Exception as e:
+                        logger.warning(f"  매도 주문 알림 발송 실패: {e}")
+
+            except Exception as e:
+                logger.error(f"  {name}({code}) 매도 처리 중 오류: {e}", exc_info=True)
+
+        # ── LLM 매도검토 판정(SELL_ALL/SELL_PARTIAL) — 기계적 규칙이 처리하지 않은 종목만 ──
+        handled_codes = {c["code"] for c in candidates}
+        llm_sold = await self._execute_llm_sell_decisions(balance, handled_codes)
+
+        return {"sold": sold, "llm_sold": llm_sold}
+
+    def _update_trade_record(
+        self,
+        fields: dict,
+        trade_id=None,
+        code: Optional[str] = None,
+        account: Optional[str] = None,
+    ):
+        """trade_id 가 있으면 그 행을, 없으면 code+status=holding+account_type 로 매칭해 갱신."""
+        q = supabase.table(TABLE_TRADES).update(fields)
+        if trade_id is not None:
+            q = q.eq("id", trade_id)
+        else:
+            q = q.eq("code", code).eq("status", "holding").eq("account_type", account)
+        q.execute()
+
+    def _apply_trailing_updates(self, trailing_updates: List[dict]):
+        """부분익절 완료 후 잔량의 샹들리에 고점/스탑을 DB 에 반영(래칫, 매도 여부와 무관)."""
+        for u in trailing_updates:
+            trade_id = u.get("trade_id")
+            if trade_id is None:
+                continue
+            try:
+                supabase.table(TABLE_TRADES).update(
+                    {
+                        "chandelier_peak_price": u["peak_price"],
+                        "chandelier_stop_price": u["stop_price"],
+                    }
+                ).eq("id", trade_id).execute()
+            except Exception as e:
+                logger.warning(f"  {u.get('code')} 샹들리에 트레일링 갱신 실패: {e}")
+
+    def _should_defer_llm_sell(self, row: dict, code: str, current_price: float) -> Optional[str]:
+        """
+        LLM 매도판정 집행 직전 재검증. 유예해야 하면 사유 문자열, 아니면 None.
+
+        두 가지를 본다 (하나라도 걸리면 유예):
+          1) 가격 — 판단 시점보다 KR_SELL_REVALIDATE_PCT 이상 유리한 방향(상승)으로 이미 움직였는가.
+          2) 근거 — 판단 시점 기술신호 개수보다 지금이 적은가(개선 신호).
+        가격만으로는 "판단의 실제 근거(신호)가 바뀌었는지"까지는 못 보므로 2)를 더한다.
+        """
+        if settings.KR_SELL_REVALIDATE_PCT <= 0:
+            return None
+
+        judged_price = row.get("price_at_decision")
+        if judged_price:
+            try:
+                judged_price = float(judged_price)
+                move_pct = (
+                    (current_price - judged_price) / judged_price * 100
+                    if judged_price > 0 else 0.0
+                )
+            except (ValueError, TypeError):
+                move_pct = 0.0
+            if move_pct >= settings.KR_SELL_REVALIDATE_PCT:
+                return (
+                    f"판단 시점({judged_price:,.0f}원) 대비 {move_pct:+.2f}% 상승"
+                    f"(재검증 임계 {settings.KR_SELL_REVALIDATE_PCT:.1f}%)"
                 )
 
+        judged_signals = row.get("signal_count_at_decision")
+        if judged_signals is not None:
+            current_signals = recommend.get_current_signal_count(code)
+            if current_signals is not None and current_signals < judged_signals:
+                return f"기술신호 {judged_signals}개 → {current_signals}개로 감소(근거 개선)"
+
+        return None
+
+    def _mark_sell_decision(self, decision_id, status: str):
+        try:
+            supabase.table(TABLE_SELL_LOGS).update(
+                {"status": status, "executed_at": datetime.now(KST).isoformat()}
+            ).eq("id", decision_id).execute()
+        except Exception as e:
+            logger.warning(f"  LLM 매도판정 상태 갱신 실패(id={decision_id}): {e}")
+
+    async def _execute_llm_sell_decisions(self, balance: dict, skip_codes: set) -> int:
+        """
+        오늘자 LLM 매도검토(kr_llm_sell_decision_logs, 코드별 최신 판단 기준)의
+        SELL_ALL/SELL_PARTIAL 미집행 판정을 집행한다. 기계적 규칙이 이번 사이클에 이미 처리한
+        종목은 건너뛴다(중복 매도 방지, 기계적 처리 우선).
+        """
+        account = kis.current_account_type()
+
+        latest = self._latest_sell_decisions_today()
+        rows = [
+            r for r in latest.values()
+            if r.get("status") == "pending" and r.get("decision") in ("SELL_ALL", "SELL_PARTIAL")
+        ]
+
+        if not rows:
+            return 0
+
+        holdings = {h.get("pdno"): h for h in balance.get("output1", []) if h.get("pdno")}
+
+        try:
+            tr_resp = (
+                supabase.table(TABLE_TRADES)
+                .select("*")
+                .eq("status", "holding")
+                .eq("account_type", account)
+                .execute()
+            )
+            trade_map = {t["code"]: t for t in (tr_resp.data or [])}
+        except Exception as e:
+            logger.warning(f"  거래기록 조회 실패(LLM 매도판정 집행 생략): {e}")
+            return 0
+
+        executed = 0
+        for row in rows:
+            code = row["code"]
+            if code in skip_codes:
+                self._mark_sell_decision(row["id"], "skipped")
+                continue
+
+            item = holdings.get(code)
+            trade = trade_map.get(code)
+            if item is None or trade is None:
+                self._mark_sell_decision(row["id"], "expired")
+                continue
+
+            try:
+                quantity = int(item.get("ord_psbl_qty", 0) or 0)
+                buy_price = float(item.get("pchs_avg_pric", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+            if quantity <= 0:
+                self._mark_sell_decision(row["id"], "expired")
+                continue
+
+            is_partial = row["decision"] == "SELL_PARTIAL"
+            sell_qty = quantity
+            if is_partial:
+                sell_qty = int(quantity * settings.KR_PARTIAL_SELL_RATIO)
+                if sell_qty < settings.KR_MIN_PARTIAL_SHARES or quantity - sell_qty < 1:
+                    is_partial = False
+                    sell_qty = quantity
+
+            current = kis.get_current_price_value(code)
+            if current is None:
+                logger.error(f"  {universe.display(code)} 현재가 조회 실패 → LLM 매도판정 다음 회차 재시도")
+                continue
+
+            # 재검증: 판단(전날 16:30) 시점 대비 가격이 이미 유리한 방향(상승)으로 크게 움직였거나,
+            # 판단 근거였던 기술신호 개수가 그새 줄었다면(근거 개선) 이번 사이클 집행을 보류한다.
+            # (취소 아님 — status 를 건드리지 않고 그냥 넘어가 다음 사이클에 다시 검사한다.
+            # 마감까지 계속 그렇다면 결국 집행되지 않고 다음날 새 판단으로 자연 대체된다.)
+            defer_reason = self._should_defer_llm_sell(row, code, current)
+            if defer_reason:
+                logger.info(
+                    f"  {universe.display(code)} LLM 매도판정 유예: {defer_reason} — "
+                    f"이번 사이클 집행 보류"
+                )
+                continue
+
+            order_price = kis.round_to_tick(current, mode="down")
+
+            result_order = kis.order_stock(code, sell_qty, order_price, is_buy=False)
+            if result_order.get("rt_cd") != "0":
+                continue
+
+            executed += 1
+            reason_code = "llm_partial_sell" if is_partial else "llm_sell_all"
+            name = trade.get("stock_name") or item.get("prdt_name", code)
+
+            if is_partial:
+                try:
+                    supabase.table(TABLE_TRADES).update(
+                        {"status": "partial_sell_ordered", "pending_partial_qty": sell_qty}
+                    ).eq("id", trade["id"]).execute()
+                except Exception as e:
+                    logger.error(f"  {name}({code}) 거래기록 갱신 실패: {e}")
+                try:
+                    notify.notify_sell_ordered(
+                        code, name, sell_qty, order_price, reason_code, is_partial=True
+                    )
+                except Exception as e:
+                    logger.warning(f"  LLM 부분매도 알림 발송 실패: {e}")
+            else:
+                pnl_leg = (order_price - buy_price) * sell_qty if buy_price > 0 else None
+                realized_pnl = float(trade.get("realized_partial_pnl") or 0)
+                realized_qty = int(trade.get("realized_partial_qty") or 0)
+                total_qty = sell_qty + realized_qty
+                pnl_total = (pnl_leg or 0) + realized_pnl if buy_price > 0 else None
+                pnl_pct_total = (
+                    (pnl_total / (buy_price * total_qty) * 100)
+                    if buy_price > 0 and total_qty > 0
+                    else None
+                )
                 try:
                     supabase.table(TABLE_TRADES).update(
                         {
                             "status": "sell_ordered",
                             "sell_price": order_price,
                             "sell_date": datetime.now(KST).isoformat(),
-                            "sell_reason": reason,
-                            "profit_loss": round(pnl, 0) if pnl is not None else None,
-                            "profit_loss_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+                            "sell_reason": reason_code,
+                            "profit_loss": round(pnl_total, 0) if pnl_total is not None else None,
+                            "profit_loss_pct": (
+                                round(pnl_pct_total, 2) if pnl_pct_total is not None else None
+                            ),
                         }
-                    ).eq("code", code).eq("status", "holding").eq(
-                        "account_type", kis.current_account_type()
-                    ).execute()
+                    ).eq("id", trade["id"]).execute()
                 except Exception as e:
                     logger.error(f"  {name}({code}) 거래기록 갱신 실패: {e}")
-
                 try:
-                    notify.notify_sell_ordered(code, name, qty, order_price, reason)
+                    notify.notify_sell_ordered(code, name, sell_qty, order_price, reason_code)
                 except Exception as e:
-                    logger.warning(f"  매도 주문 알림 발송 실패: {e}")
+                    logger.warning(f"  LLM 매도 알림 발송 실패: {e}")
 
-            except Exception as e:
-                logger.error(f"  {name}({code}) 매도 처리 중 오류: {e}", exc_info=True)
+            self._mark_sell_decision(row["id"], "executed")
 
-        return {"sold": sold}
+        return executed
 
     def _reconcile_orders(self, balance: Optional[dict] = None):
         """
@@ -833,7 +1250,7 @@ class KrScheduler:
             resp = (
                 supabase.table(TABLE_TRADES)
                 .select("*")
-                .in_("status", ["buy_ordered", "holding", "sell_ordered"])
+                .in_("status", ["buy_ordered", "holding", "sell_ordered", "partial_sell_ordered"])
                 .eq("account_type", account)
                 .execute()
             )
@@ -934,6 +1351,95 @@ class KrScheduler:
                         ).eq("id", rec_id).execute()
                         logger.warning(f"  {name}({code}) 매도 미체결 (장 마감) → holding 복원")
 
+                elif status == "partial_sell_ordered":
+                    prev_qty = rec.get("holding_quantity") or 0
+                    pending_qty = rec.get("pending_partial_qty") or 0
+                    expected_remaining = prev_qty - pending_qty
+
+                    if pending_qty > 0 and kis_qty == expected_remaining:
+                        # 부분매도 체결 확정 — 잔량은 holding 유지, 샹들리에 트레일링 시작
+                        try:
+                            current_price = float(
+                                kis_holdings.get(code, {}).get("item", {}).get("prpr", 0) or 0
+                            )
+                        except (ValueError, TypeError):
+                            current_price = 0.0
+                        peak = current_price or float(rec.get("chandelier_peak_price") or 0) or None
+                        atr = rec.get("atr")
+                        stop_loss_price = rec.get("stop_loss_price")
+                        stop = None
+                        if peak is not None and atr:
+                            try:
+                                stop = peak - settings.KR_CHANDELIER_ATR_MULT * float(atr)
+                                if stop_loss_price is not None:
+                                    stop = max(stop, float(stop_loss_price))
+                            except (ValueError, TypeError):
+                                stop = None
+
+                        fill_price = current_price or float(rec.get("buy_price") or 0)
+                        buy_price = float(rec.get("buy_price") or 0)
+                        pnl = (fill_price - buy_price) * pending_qty if buy_price > 0 else None
+                        prev_realized_pnl = float(rec.get("realized_partial_pnl") or 0)
+                        prev_realized_qty = int(rec.get("realized_partial_qty") or 0)
+
+                        update_fields = {
+                            "status": "holding",
+                            "holding_quantity": kis_qty,
+                            "partial_exit_done": True,
+                            "pending_partial_qty": None,
+                            "realized_partial_pnl": prev_realized_pnl + (pnl or 0),
+                            "realized_partial_qty": prev_realized_qty + pending_qty,
+                        }
+                        if peak is not None:
+                            update_fields["chandelier_peak_price"] = peak
+                        if stop is not None:
+                            update_fields["chandelier_stop_price"] = stop
+
+                        supabase.table(TABLE_TRADES).update(update_fields).eq("id", rec_id).execute()
+                        logger.info(
+                            f"  {name}({code}) 부분매도 체결 확인 → holding ({kis_qty}주, "
+                            f"{pending_qty}주 부분익절 완료, 잔량 샹들리에 트레일링 시작)"
+                        )
+
+                        try:
+                            notify.notify_sell_filled(
+                                code=code,
+                                stock_name=name,
+                                qty=pending_qty,
+                                fill_price=fill_price,
+                                sell_reason="partial_take_profit",
+                                profit_loss=pnl or 0,
+                                profit_loss_pct=(
+                                    (fill_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
+                                ),
+                                buy_price=rec.get("buy_price"),
+                                buy_date=rec.get("buy_date"),
+                                is_partial=True,
+                            )
+                        except Exception as e:
+                            logger.warning(f"  {code} 부분매도 체결 알림 발송 실패: {e}")
+
+                    elif kis_qty == prev_qty and after_close:
+                        # 미체결 — 부분매도 주문이 장중 안 먹힘. 원상 복구.
+                        supabase.table(TABLE_TRADES).update(
+                            {"status": "holding", "pending_partial_qty": None}
+                        ).eq("id", rec_id).execute()
+                        logger.warning(f"  {name}({code}) 부분매도 미체결 (장 마감) → holding 복원")
+
+                    else:
+                        # 예상 밖 수량(수동 개입 등) — KIS 원장을 신뢰해 동기화만 한다
+                        supabase.table(TABLE_TRADES).update(
+                            {
+                                "status": "holding",
+                                "holding_quantity": kis_qty,
+                                "pending_partial_qty": None,
+                            }
+                        ).eq("id", rec_id).execute()
+                        logger.warning(
+                            f"  {name}({code}) 부분매도 수량 불일치(예상 {expected_remaining} vs "
+                            f"실제 {kis_qty}) → KIS 원장 기준으로 동기화"
+                        )
+
             except Exception as e:
                 logger.error(f"  {name}({code}) 정합성 처리 실패: {e}")
 
@@ -1008,3 +1514,16 @@ def run_buy_execution_now(force: bool = False) -> bool:
 def run_auto_sell_now() -> bool:
     """매도 판단 즉시 실행."""
     return _run_in_thread(lambda: kr_scheduler.execute_auto_sell())
+
+
+def run_sell_review_now() -> bool:
+    """보유 종목 LLM 매도검토 즉시 실행 (동기 함수라 별도 스레드에서 직접 실행)."""
+
+    def _runner():
+        try:
+            kr_scheduler._build_sell_review()
+        except Exception as e:
+            logger.error(f"수동 매도검토 실행 중 오류: {e}", exc_info=True)
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return True

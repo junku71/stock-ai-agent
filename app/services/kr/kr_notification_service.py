@@ -11,10 +11,12 @@ SLACK_WEBHOOK_URL 이 비어 있으면 모든 함수가 조용히 no-op 이다.
   ③ notify_buy_queued       — 다음 영업일 매수 예약 목록 (장 마감 후 분석 결과)
   ④ notify_buy_ordered      — 매수 주문 접수
   ⑤ notify_buy_filled       — 매수 체결 (계좌 요약 + 보유 현황표)
-  ⑥ notify_sell_ordered     — 매도 주문 접수
+  ⑥ notify_sell_ordered     — 매도 주문 접수 (부분매도는 is_partial=True)
   ⑦ notify_sell_filled      — 매도 체결 (손익 + 보유 현황표)
   ⑧ notify_pipeline_failure — 파이프라인 실패
   ⑨ notify_llm_failure      — LLM 검토 전체 실패 (Fail-Close 매수 차단)
+  ⑩ notify_llm_sell_decisions — 보유 종목 LLM 매도검토 결과(HOLD/SELL_ALL/SELL_PARTIAL)
+  ⑪ notify_llm_sell_failure   — LLM 매도검토 전체 실패 (Fail-Close 추가매도 보류, 기계적 규칙은 계속 작동)
 """
 import logging
 from datetime import datetime
@@ -356,20 +358,37 @@ def notify_buy_filled(
 
 _SELL_REASON_KR = {
     "take_profit": "익절 (ATR 목표가 도달)",
+    "partial_take_profit": "부분 익절 (ATR 목표가 도달 — 잔량은 트레일링 전환)",
+    "chandelier_stop": "샹들리에 트레일링 이탈 (부분익절 후 잔량 청산)",
     "stop_loss": "손절 (ATR 손실 한도 도달)",
     "signal": "기술 신호 매도",
     "panic_sell": "패닉셀 (급락 + 거래량 폭증)",
     "flow_out": "수급 이탈 (외국인·기관 순매도)",
+    "llm_sell_all": "LLM 매도검토 (전량)",
+    "llm_partial_sell": "LLM 매도검토 (일부)",
 }
 
 
-def notify_sell_ordered(code: str, stock_name: str, qty: int, price: int, sell_reason: str):
+def notify_sell_ordered(
+    code: str,
+    stock_name: str,
+    qty: int,
+    price: int,
+    sell_reason: str,
+    is_partial: bool = False,
+):
+    prefix = "[부분매도] " if is_partial else ""
+    tail = (
+        "\n_⏳ 체결 확인 후 잔량은 트레일링 스탑으로 계속 보유됩니다._"
+        if is_partial
+        else "\n_⏳ 체결은 정규장(09:00~15:30 KST) 매칭 후 별도 '체결' 알림으로 안내됩니다._"
+    )
     _send(
-        title=f"📋 {_mode_tag()} 매도 주문 접수: {stock_name} ({code})",
+        title=f"📋 {_mode_tag()} {prefix}매도 주문 접수: {stock_name} ({code})",
         message=(
             f"*수량:* {qty:,}주  *주문가(지정가):* {price:,}원  "
-            f"*사유:* `{_SELL_REASON_KR.get(sell_reason, sell_reason)}`\n"
-            f"_⏳ 체결은 정규장(09:00~15:30 KST) 매칭 후 별도 '체결' 알림으로 안내됩니다._"
+            f"*사유:* `{_SELL_REASON_KR.get(sell_reason, sell_reason)}`"
+            f"{tail}"
         ),
         color="#3b82f6",
     )
@@ -385,17 +404,21 @@ def notify_sell_filled(
     profit_loss_pct: float,
     buy_price: Optional[float] = None,
     buy_date: Optional[str] = None,
+    is_partial: bool = False,
 ):
     is_profit = profit_loss >= 0
     icon = "💰" if is_profit else "🩸"
     color = "#2eb886" if is_profit else "#ff9800"
     sign = "+" if is_profit else ""
+    prefix = "[부분매도] " if is_partial else ""
 
     parts = ["*이번 거래*", f"  {qty:,}주 @ {fill_price:,.0f}원"]
     if buy_price:
         parts.append(f"  매수가 {buy_price:,.0f}원 → 매도가 {fill_price:,.0f}원")
     parts.append(f"  손익: *{sign}{profit_loss:,.0f}원* ({sign}{profit_loss_pct:.2f}%)")
     parts.append(f"  사유: `{_SELL_REASON_KR.get(sell_reason, sell_reason)}`")
+    if is_partial:
+        parts.append("  _잔량은 트레일링 스탑으로 계속 보유됩니다._")
 
     if buy_date:
         try:
@@ -417,11 +440,80 @@ def notify_sell_filled(
 
     _send(
         title=(
-            f"{icon} {_mode_tag()} 매도 체결: {stock_name} ({code})  "
+            f"{icon} {_mode_tag()} {prefix}매도 체결: {stock_name} ({code})  "
             f"{sign}{profit_loss:,.0f}원 ({sign}{profit_loss_pct:.2f}%)"
         ),
         message="\n".join(parts),
         color=color,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# LLM 매도검토
+# ══════════════════════════════════════════════════════════════════
+
+def notify_llm_sell_decisions(
+    decisions: List[dict],
+    market_analysis: str = "",
+    market: Optional[dict] = None,
+    is_intraday: bool = False,
+):
+    """보유 종목 LLM 매도검토 결과 요약. is_intraday=True 면 정기(16:30)가 아니라 공포장 지속에
+    따른 장중 추가 재점검이다 — 결정은 오늘 바로 집행 대상이 될 수 있어 제목으로 구분한다."""
+    market = market or {}
+    tag = "⏱ 장중 재점검" if is_intraday else "정기"
+
+    sell_lines = [
+        f"• *{d.get('stock_name')}* ({d.get('code')}) `{d.get('decision')}` — _{d.get('reason', '')}_"
+        for d in decisions
+        if d.get("decision") != "HOLD"
+    ]
+    hold_lines = [
+        f"• {d.get('stock_name')} ({d.get('code')}) — _{d.get('reason', '')}_"
+        for d in decisions
+        if d.get("decision") == "HOLD"
+    ]
+
+    if not decisions:
+        _send(
+            title=f"📋 {_mode_tag()} 보유 종목 LLM 매도검토({tag}) — 대상 없음",
+            message="보유 종목이 없어 매도검토를 생략했습니다.",
+            color="#888888",
+        )
+        return
+
+    parts = []
+    if market_analysis:
+        parts.append(f"💬 *시장 분석:* {market_analysis}")
+    if sell_lines:
+        execute_note = "이번 매도 감시 사이클부터 집행" if is_intraday else "다음 매도 감시 사이클에 집행"
+        parts.append(f"🔴 *매도 판정 ({len(sell_lines)}건 — {execute_note})*\n" + "\n".join(sell_lines))
+    if hold_lines:
+        parts.append(f"🟡 *HOLD ({len(hold_lines)}건)*\n" + "\n".join(hold_lines))
+
+    _send(
+        title=(
+            f"📋 {_mode_tag()} 보유 종목 LLM 매도검토({tag}) — "
+            f"HOLD {len(hold_lines)} / 매도판정 {len(sell_lines)}"
+        ),
+        message="\n\n".join(parts),
+        color="#3b82f6" if sell_lines else "#888888",
+    )
+
+
+def notify_llm_sell_failure(reason: str, held_count: int = 0):
+    _send(
+        title=f"⚠️ {_mode_tag()} LLM 매도검토 실패 — 추가 매도 보류",
+        message=(
+            f"Claude API 호출이 전부 실패했습니다 (Opus + Sonnet 폴백 포함).\n"
+            f"Fail-Close 정책에 따라 *이번 사이클은 추가 매도를 진행하지 않습니다* (전 종목 HOLD).\n"
+            f"기계적 손절/부분익절/샹들리에 트레일링·기술신호개수·공포장 자동매도 규칙은 "
+            f"이 실패와 무관하게 계속 정상 작동합니다.\n\n"
+            f"검토 대상 보유종목: *{held_count}개*\n\n"
+            f"*에러:*\n```{(reason or '')[:500]}```"
+        ),
+        color="#f59e0b",
+        fields={"조치 권장": "ANTHROPIC_API_KEY / 잔액 / 서비스 상태 확인"},
     )
 
 

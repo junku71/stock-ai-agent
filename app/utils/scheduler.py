@@ -12,6 +12,7 @@ from app.services.balance_service import (
 from app.services.volume_service import get_overseas_daily_price
 from app.db.supabase import supabase
 from app.core.config import settings
+from app.services import market_switch_service
 import logging
 from app.services.economic_service import update_economic_data_in_background
 from app.services.llm_review_service import review_buy_candidates
@@ -514,6 +515,13 @@ class StockScheduler:
         Args:
             force: True 면 시간/중복 체크 우회 (통합 파이프라인에서 즉시 실행 시 사용)
         """
+        # 매수 원격 스위치 — force 여부와 무관하게 무조건 체크한다("꺼지면 다시 켤 때까지
+        # 계속 꺼짐"이 요구사항이라, 강제 트리거가 이 스위치를 우회하면 안 된다). 매도/정합성
+        # 확인은 이 스위치와 무관하게 별도로 계속 돈다.
+        if not market_switch_service.is_buy_enabled("US"):
+            logger.info("미국 시장 매수 스위치 꺼짐 — 자동 매수 스킵")
+            return
+
         # 뉴욕 시간 확인 (서머타임 자동 고려)
         now_in_ny = datetime.now(pytz.timezone('America/New_York'))
         ny_hour = now_in_ny.hour

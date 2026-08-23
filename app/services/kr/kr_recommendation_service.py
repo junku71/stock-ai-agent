@@ -6,7 +6,10 @@
 KIS 국내 일봉의 필드명만 해외 일봉 형식으로 정규화해서 넘긴다.
 
 매수 후보 = ML 예측 ∩ 기술적 지표 ∩ 감성 ∩ 수급 → kr_scoring 으로 채점
-매도 후보 = ATR 익절/손절 ∪ 기술적 매도신호 ∪ 공포장 조건
+
+매도는 두 층으로 나뉜다:
+  기계적(get_mechanical_sell_candidates) = ATR 손절/부분익절+샹들리에 트레일링 ∪ 기술적 매도신호 ∪ 공포장 조건
+  LLM 정성적(get_llm_sell_context + kr_llm_sell_review_service) = 점수감쇠 ∪ 교체매매 후보
 """
 import logging
 from datetime import datetime, timedelta
@@ -17,6 +20,7 @@ import pytz
 
 from app.core.config import settings
 from app.db.supabase import supabase
+from app.services import market_switch_service
 from app.services.kr import kis_domestic_service as kis
 from app.services.kr import kr_market_data_service, kr_override_service, kr_scoring, universe
 # 지표 수식(SMA/EMA/RSI/MACD/ATR/ADX)은 시장 무관이라 미국 트랙 구현을 그대로 쓴다
@@ -83,6 +87,50 @@ def compute_atr(code: str, days: int = 40) -> Optional[float]:
     except Exception as e:
         logger.warning(f"  {universe.display(code)} ATR 계산 실패: {e}")
         return None
+
+
+def _kis_technical_snapshot(code: str) -> dict:
+    """
+    KIS 일봉 기반 지표(거래량비율/ADX/ATR/당일변동률) 한 종목분.
+
+    generate_technical_recommendations()(유니버스 100종목)와 get_scored_universe()
+    (유니버스 밖 보유종목 포함)가 공유한다.
+    """
+    result = {"volume_ratio": None, "adx": None, "atr": None, "daily_change_pct": None}
+    try:
+        raw = kis.get_recent_daily_chart(code, days=60)
+        daily = _normalize_daily(raw)
+
+        # 장 마감(15:30 KST) 전이면 당일 봉은 미완성이므로 제외한다.
+        # 미완성 봉을 쓰면 거래량비율이 비정상적으로 낮게 나오고 ATR 도 왜곡된다.
+        if daily and daily[0]["xymd"] == datetime.now(KST).strftime("%Y%m%d"):
+            now = datetime.now(KST)
+            market_closed = now.hour > 15 or (now.hour == 15 and now.minute >= 30)
+            if not market_closed:
+                logger.info(f"  {universe.display(code)} 당일 봉 미완성 → 제외")
+                daily = daily[1:]
+
+        if len(daily) >= 6:
+            today_vol = int(daily[0]["tvol"])
+            past = [int(d["tvol"]) for d in daily[1:6] if int(d["tvol"]) > 0]
+            if past:
+                avg = sum(past) / len(past)
+                result["volume_ratio"] = round(today_vol / avg, 2) if avg > 0 else None
+
+        if len(daily) >= 2:
+            today_close = float(daily[0]["clos"])
+            prev_close = float(daily[1]["clos"])
+            if prev_close > 0:
+                result["daily_change_pct"] = round(
+                    (today_close - prev_close) / prev_close * 100, 2
+                )
+
+        if daily:
+            result["adx"] = _indicators.calculate_adx(daily)
+            result["atr"] = _indicators.calculate_atr(daily)
+    except Exception as e:
+        logger.warning(f"  {universe.display(code)} 일봉 지표 계산 실패: {e}")
+    return result
 
 
 def _net_buy_strength(code: str) -> Optional[float]:
@@ -169,40 +217,11 @@ def generate_technical_recommendations() -> dict:
         )
 
         # ── KIS 일봉 기반 지표 ──────────────────────────────
-        volume_ratio = adx = atr = daily_change_pct = None
-        try:
-            raw = kis.get_recent_daily_chart(code, days=60)
-            daily = _normalize_daily(raw)
-
-            # 장 마감(15:30 KST) 전이면 당일 봉은 미완성이므로 제외한다.
-            # 미완성 봉을 쓰면 거래량비율이 비정상적으로 낮게 나오고 ATR 도 왜곡된다.
-            if daily and daily[0]["xymd"] == datetime.now(KST).strftime("%Y%m%d"):
-                now = datetime.now(KST)
-                market_closed = now.hour > 15 or (now.hour == 15 and now.minute >= 30)
-                if not market_closed:
-                    logger.info(f"  {universe.display(code)} 당일 봉 미완성 → 제외")
-                    daily = daily[1:]
-
-            if len(daily) >= 6:
-                today_vol = int(daily[0]["tvol"])
-                past = [int(d["tvol"]) for d in daily[1:6] if int(d["tvol"]) > 0]
-                if past:
-                    avg = sum(past) / len(past)
-                    volume_ratio = round(today_vol / avg, 2) if avg > 0 else None
-
-            if len(daily) >= 2:
-                today_close = float(daily[0]["clos"])
-                prev_close = float(daily[1]["clos"])
-                if prev_close > 0:
-                    daily_change_pct = round(
-                        (today_close - prev_close) / prev_close * 100, 2
-                    )
-
-            if daily:
-                adx = _indicators.calculate_adx(daily)
-                atr = _indicators.calculate_atr(daily)
-        except Exception as e:
-            logger.warning(f"  {universe.display(code)} 일봉 지표 계산 실패: {e}")
+        snap = _kis_technical_snapshot(code)
+        volume_ratio = snap["volume_ratio"]
+        adx = snap["adx"]
+        atr = snap["atr"]
+        daily_change_pct = snap["daily_change_pct"]
 
         # ── 수급 ────────────────────────────────────────────
         try:
@@ -282,24 +301,11 @@ def _load_ml_predictions() -> Dict[str, dict]:
     return latest
 
 
-def get_buy_candidates() -> dict:
-    """
-    ML + 기술 + 감성 + 수급 + 시장환경을 통합해 매수 후보를 반환한다.
-
-    필터:
-      - ML 정확도 >= KR_MIN_ML_ACCURACY (기본 80%) — 신뢰도 낮은 예측 배제
-      - ML 예측 상승률 >= KR_MIN_RISE_PROBABILITY (기본 2%)
-      - 코스피 20일 실현변동성 > FEAR_HARD_BLOCK → 매수 전면 중단 (공포장 하드블록)
-        단, kr_override_service 의 수동 오버라이드가 활성이면 계속 진행한다
-      - RSI > 80 하드블록, 기술 신호 2개 이상 (kr_scoring 사전 필터)
-      - composite_score >= 변동성 적응형 임계값
-    """
+def _load_candidate_maps() -> "tuple[Dict[str, dict], Dict[str, dict], Dict[str, dict]]":
+    """(tech_map, ml_map, sentiment_map) — get_buy_candidates()/get_scored_universe() 공용."""
     tech_resp = supabase.table(TABLE_TECH).select("*").order("날짜", desc=True).execute()
-    if not tech_resp.data:
-        return {"message": "기술적 지표 데이터가 없습니다", "results": []}
-
     tech_map: Dict[str, dict] = {}
-    for row in tech_resp.data:
+    for row in tech_resp.data or []:
         code = row.get("code")
         if code and code not in tech_map:
             tech_map[code] = row
@@ -312,6 +318,71 @@ def get_buy_candidates() -> dict:
     except Exception as e:
         logger.warning(f"감성 데이터 조회 실패(중립 처리): {e}")
         sentiment_map = {}
+
+    return tech_map, ml_map, sentiment_map
+
+
+def _f(v, default=None):
+    try:
+        return None if v is None else float(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _build_candidate_dict(
+    code: str, tech: dict, ml: Optional[dict], sentiment: Optional[dict]
+) -> dict:
+    """tech/ml/sentiment 원본 행 → 채점용 후보 dict. ml 이 None 이어도 동작한다(점수용 유니버스)."""
+    ml = ml or {}
+    return {
+        "code": code,
+        "ticker": code,  # 공통 모듈 호환용 별칭
+        "stock_name": tech.get("종목") or universe.CODE_TO_NAME.get(code, code),
+        "sector": universe.CODE_TO_SECTOR.get(code, ""),
+        # ML
+        "accuracy": _f(ml.get("accuracy")),
+        "rise_probability": _f(ml.get("rise_probability"), 0.0) or 0.0,
+        "last_price": _f(ml.get("last_actual_price")),
+        "predicted_price": _f(ml.get("predicted_future_price")),
+        "analysis": ml.get("analysis"),
+        # 기술
+        "technical_date": tech.get("날짜"),
+        "sma20": _f(tech.get("SMA20"), 0.0),
+        "sma50": _f(tech.get("SMA50"), 0.0),
+        "golden_cross": bool(tech.get("골든_크로스")),
+        "rsi": _f(tech.get("RSI"), 50.0),
+        "macd": _f(tech.get("MACD"), 0.0),
+        "signal": _f(tech.get("Signal"), 0.0),
+        "macd_buy_signal": bool(tech.get("MACD_매수_신호")),
+        "technical_recommended": bool(tech.get("추천_여부")),
+        "volume_ratio": _f(tech.get("volume_ratio")),
+        "adx": _f(tech.get("adx")),
+        "atr": _f(tech.get("atr")),
+        "daily_change_pct": _f(tech.get("daily_change_pct")),
+        # 수급 (kr_scoring 이 z-score 화)
+        "net_buy_score": _f(tech.get("net_buy_5d")),
+        # 감성
+        "sentiment_score": _f(sentiment.get("sentiment_score")) if sentiment else None,
+        "article_count": (sentiment or {}).get("article_count"),
+        "sentiment_summary": (sentiment or {}).get("summary"),
+    }
+
+
+def get_buy_candidates() -> dict:
+    """
+    ML + 기술 + 감성 + 수급 + 시장환경을 통합해 매수 후보를 반환한다.
+
+    필터:
+      - ML 정확도 >= KR_MIN_ML_ACCURACY (기본 80%) — 신뢰도 낮은 예측 배제
+      - ML 예측 상승률 >= KR_MIN_RISE_PROBABILITY (기본 2%)
+      - 코스피 20일 실현변동성 > FEAR_HARD_BLOCK → 매수 전면 중단 (공포장 하드블록)
+        단, kr_override_service 의 수동 오버라이드가 활성이면 계속 진행한다
+      - RSI > 80 하드블록, 기술 신호 2개 이상 (kr_scoring 사전 필터)
+      - composite_score >= 변동성 적응형 임계값
+    """
+    tech_map, ml_map, sentiment_map = _load_candidate_maps()
+    if not tech_map:
+        return {"message": "기술적 지표 데이터가 없습니다", "results": []}
 
     market = kr_market_data_service.get_market_context()
     fear_index = market.get("kospi_vol_20d")
@@ -366,48 +437,7 @@ def get_buy_candidates() -> dict:
             dropped["low_rise"] += 1
             continue
 
-        sentiment = sentiment_map.get(code)
-
-        def _f(v, default=None):
-            try:
-                return None if v is None else float(v)
-            except (ValueError, TypeError):
-                return default
-
-        candidates.append(
-            {
-                "code": code,
-                "ticker": code,  # 공통 모듈 호환용 별칭
-                "stock_name": tech.get("종목") or universe.CODE_TO_NAME.get(code, code),
-                "sector": universe.CODE_TO_SECTOR.get(code, ""),
-                # ML
-                "accuracy": _f(ml.get("accuracy")),
-                "rise_probability": rise_probability,
-                "last_price": _f(ml.get("last_actual_price")),
-                "predicted_price": _f(ml.get("predicted_future_price")),
-                "analysis": ml.get("analysis"),
-                # 기술
-                "technical_date": tech.get("날짜"),
-                "sma20": _f(tech.get("SMA20"), 0.0),
-                "sma50": _f(tech.get("SMA50"), 0.0),
-                "golden_cross": bool(tech.get("골든_크로스")),
-                "rsi": _f(tech.get("RSI"), 50.0),
-                "macd": _f(tech.get("MACD"), 0.0),
-                "signal": _f(tech.get("Signal"), 0.0),
-                "macd_buy_signal": bool(tech.get("MACD_매수_신호")),
-                "technical_recommended": bool(tech.get("추천_여부")),
-                "volume_ratio": _f(tech.get("volume_ratio")),
-                "adx": _f(tech.get("adx")),
-                "atr": _f(tech.get("atr")),
-                "daily_change_pct": _f(tech.get("daily_change_pct")),
-                # 수급 (kr_scoring 이 z-score 화)
-                "net_buy_score": _f(tech.get("net_buy_5d")),
-                # 감성
-                "sentiment_score": _f(sentiment.get("sentiment_score")) if sentiment else None,
-                "article_count": (sentiment or {}).get("article_count"),
-                "sentiment_summary": (sentiment or {}).get("summary"),
-            }
-        )
+        candidates.append(_build_candidate_dict(code, tech, ml, sentiment_map.get(code)))
 
     logger.info(
         f"  ML 필터: {len(tech_map)}종목 중 {len(candidates)}개 통과 "
@@ -456,19 +486,200 @@ def get_buy_candidates() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3) 매도 후보
+# 3) 점수 유니버스 (보유종목 점수감쇠 판단용 — 임계값 컷 없음)
 # ══════════════════════════════════════════════════════════════════
 
-def get_sell_candidates(balance: Optional[dict] = None) -> dict:
+def get_scored_universe(extra_codes: Optional[List[str]] = None) -> dict:
     """
-    보유 종목 중 매도 대상 식별.
+    유니버스 전체(정확도/상승률 프리필터·임계값 컷 없이) cross-sectional 채점.
 
-    조건 1: ATR 기반 익절/손절 (kr_trade_records 기준, 없으면 고정 비율 폴백)
-    조건 2: 기술적 매도 신호 (데드크로스 / RSI>70 / MACD 매도 / 패닉셀)
-            - ADX>25 면 필요 신호 수 1개 차감
-            - 2a: 감성 < -0.15 이면 신호 2개(ADX 보정 시 1개)로 매도
-            - 2b: 신호 3개(ADX 보정 시 2개)면 매도
-    조건 3: 공포장 — 변동성>30 + 신호2개, 변동성>40 + 신호1개
+    get_buy_candidates() 는 오늘의 매수 자격이 있는 종목만 반환하지만, 보유종목의 점수감쇠를
+    보려면 필터를 통과했는지와 무관하게 전체 피어 그룹 내 상대 위치가 필요하다.
+    extra_codes 는 유니버스 밖 보유종목 — SMA/RSI/MACD 는 계산할 수 없어 중립값으로 두고
+    ADX/거래량/ATR/감성만 반영한 부분 점수를 매긴다.
+    """
+    tech_map, ml_map, sentiment_map = _load_candidate_maps()
+    market = kr_market_data_service.get_market_context()
+    fear_index = market.get("kospi_vol_20d")
+
+    candidates = [
+        _build_candidate_dict(code, tech, ml_map.get(code), sentiment_map.get(code))
+        for code, tech in tech_map.items()
+    ]
+
+    for code in extra_codes or []:
+        if code in tech_map:
+            continue
+        snap = _kis_technical_snapshot(code)
+        pseudo_tech = {
+            "종목": universe.CODE_TO_NAME.get(code, code),
+            "SMA20": 0.0,
+            "SMA50": 0.0,
+            "골든_크로스": False,
+            "RSI": 50.0,
+            "MACD": 0.0,
+            "Signal": 0.0,
+            "MACD_매수_신호": False,
+            "volume_ratio": snap["volume_ratio"],
+            "adx": snap["adx"],
+            "atr": snap["atr"],
+            "daily_change_pct": snap["daily_change_pct"],
+            "net_buy_5d": None,
+        }
+        cand = _build_candidate_dict(code, pseudo_tech, ml_map.get(code), sentiment_map.get(code))
+        cand["score_note"] = "유니버스 밖 — SMA/RSI/MACD 미포함(중립값), ADX/거래량/ATR/감성만 반영"
+        candidates.append(cand)
+
+    if not candidates:
+        return {"scored": {}, "market": market, "asof": datetime.now(KST).strftime("%Y-%m-%d")}
+
+    kr_scoring.compute_scores(candidates, fear_index)
+    candidates.sort(key=lambda c: c["composite_score"], reverse=True)
+    for i, c in enumerate(candidates, 1):
+        c["rank"] = i
+
+    return {
+        "scored": {c["code"]: c for c in candidates},
+        "universe_size": len(candidates),
+        "market": market,
+        "asof": datetime.now(KST).strftime("%Y-%m-%d"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# 4) 매도 후보
+# ══════════════════════════════════════════════════════════════════
+
+def _technical_sell_signals(
+    tech: Optional[dict], sentiment: Optional[dict], fear_index: Optional[float]
+) -> dict:
+    """
+    기술적 매도 신호(데드크로스/RSI/MACD/패닉셀/수급이탈) + 공포장 조건 계산.
+
+    get_mechanical_sell_candidates()(기계적 자동매도, 조건 2/3)와 get_llm_sell_context()
+    (LLM 정성적 컨텍스트)가 동일한 계산을 공유한다 — 두 곳의 신호값이 어긋나지 않게 하기 위함.
+    """
+    signal_count = 0
+    signal_details: List[str] = []
+    adx_value = None
+
+    if tech:
+        if not tech.get("골든_크로스"):
+            signal_count += 1
+            signal_details.append("데드 크로스")
+
+        try:
+            rsi_val = float(tech.get("RSI", 50) or 50)
+            if rsi_val > 70:
+                signal_count += 1
+                signal_details.append(f"RSI 과매수({rsi_val:.1f})")
+        except (ValueError, TypeError):
+            pass
+
+        if not tech.get("MACD_매수_신호"):
+            signal_count += 1
+            signal_details.append("MACD 매도 신호")
+
+        # 패닉셀: 거래량 2배 이상 + 당일 -3% 이상
+        try:
+            vr = tech.get("volume_ratio")
+            dc = tech.get("daily_change_pct")
+            if vr is not None and dc is not None and float(vr) >= 2.0 and float(dc) <= -3:
+                signal_count += 1
+                signal_details.append(
+                    f"패닉셀(거래량 {float(vr):.1f}배, 당일 {float(dc):.1f}%)"
+                )
+        except (ValueError, TypeError):
+            pass
+
+        # 수급 이탈: 외국인+기관 5일 순매도 (한국 시장 전용 신호)
+        try:
+            nb = tech.get("net_buy_5d")
+            if nb is not None and float(nb) < 0:
+                signal_count += 1
+                signal_details.append(f"외국인·기관 5일 순매도({float(nb):,.0f}백만원)")
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            adx_value = float(tech["adx"]) if tech.get("adx") is not None else None
+        except (ValueError, TypeError):
+            adx_value = None
+
+    adx_adj = 1 if adx_value is not None and adx_value > 25 else 0
+    adx_note = f", ADX={adx_value:.1f} 보정" if adx_adj else ""
+
+    sentiment_score = None
+    if sentiment:
+        try:
+            sentiment_score = float(sentiment.get("sentiment_score"))
+        except (ValueError, TypeError):
+            sentiment_score = None
+
+    reasons: List[str] = []
+    required_3 = 3 - adx_adj
+    if signal_count >= required_3:
+        reasons.append(
+            f"기술적 매도 신호 {signal_count}/{required_3}개: "
+            f"{', '.join(signal_details)}{adx_note}"
+        )
+    elif sentiment_score is not None and sentiment_score < -0.15:
+        required_2 = 2 - adx_adj
+        if signal_count >= required_2:
+            reasons.append(
+                f"부정적 감성({sentiment_score:.2f}) + 매도 신호 "
+                f"{signal_count}/{required_2}개: {', '.join(signal_details)}{adx_note}"
+            )
+
+    # ── 공포장 ────────────────────────────────────────────
+    # 극단 40→60, 완화 30→40 으로 문턱을 올렸다 — 종전 문턱은 "불안한 정도"에도 신호 1개로
+    # 전량매도가 나가버려, 같은 원본 신호를 보고 더 정교하게 판단하는 LLM 의 SELL_PARTIAL 같은
+    # 선택지가 실행 기회조차 못 얻는 경우가 많았다. 진짜 극단적 국면에서만 기계적으로 개입한다.
+    if fear_index is not None and signal_count >= 1:
+        if fear_index > 60:
+            reasons.append(
+                f"극단적 공포(변동성 {fear_index:.1f}%) + 매도 신호 {signal_count}개: "
+                f"{', '.join(signal_details)}"
+            )
+        elif fear_index > 40 and signal_count >= 2:
+            reasons.append(
+                f"공포 시장(변동성 {fear_index:.1f}%) + 매도 신호 {signal_count}개: "
+                f"{', '.join(signal_details)}"
+            )
+
+    return {
+        "reasons": reasons,
+        "signal_count": signal_count,
+        "signal_details": signal_details,
+        "adx_value": adx_value,
+        "sentiment_score": sentiment_score,
+    }
+
+
+def _reason_code_from_signal_details(signal_details: List[str]) -> str:
+    joined = " ".join(signal_details)
+    if "패닉셀" in joined:
+        return "panic_sell"
+    if "순매도" in joined:
+        return "flow_out"
+    return "signal"
+
+
+def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
+    """
+    보유 종목 중 매도 대상 식별 (기계적 규칙 — LLM 과 무관하게 항상 실행).
+
+    종목당 아래 순서로 한 가지만 발동한다 (조건 1 이 발동하면 조건 2/3 은 건너뜀):
+      조건 1: ATR 손절 / 샹들리에 트레일링 이탈(부분익절 후) → 전량매도
+              부분익절 미실행 + 익절가 도달 → 부분매도(KR_PARTIAL_SELL_RATIO), 잔량은 샹들리에로 전환
+              (ATR/거래기록 없는 레거시 보유분은 고정비율 전량 익절/손절만)
+      조건 2: 기술적 매도 신호 개수 (데드크로스/RSI>70/MACD매도/패닉셀/수급이탈, ADX 보정) → 전량매도
+      조건 3: 공포장(변동성>30+신호2개, >40+신호1개) → 전량매도
+
+    반환:
+      sell_candidates — 각 항목에 exit_type("full"/"partial"), reason_code 포함
+      trailing_updates — 부분익절 완료 후 보유 중인 종목의 최신 peak/stop (매도 여부와 무관하게
+                          매 사이클 갱신 필요. 이 함수는 읽기 전용이라 DB 반영은 호출부가 한다)
     """
     if balance is None:
         balance = kis.get_balance()
@@ -477,13 +688,13 @@ def get_sell_candidates(balance: Optional[dict] = None) -> dict:
         return {
             "message": f"잔고 조회 실패: {balance.get('msg1', '')}",
             "sell_candidates": [],
+            "trailing_updates": [],
         }
 
     holdings = balance.get("output1", [])
     if not holdings:
-        return {"message": "보유 종목이 없습니다", "sell_candidates": []}
+        return {"message": "보유 종목이 없습니다", "sell_candidates": [], "trailing_updates": []}
 
-    # 기술적 지표
     tech_map: Dict[str, dict] = {}
     try:
         tech_resp = supabase.table(TABLE_TECH).select("*").order("날짜", desc=True).execute()
@@ -494,7 +705,6 @@ def get_sell_candidates(balance: Optional[dict] = None) -> dict:
     except Exception as e:
         logger.warning(f"매도 판단용 기술 지표 조회 실패: {e}")
 
-    # 감성
     sentiment_map: Dict[str, dict] = {}
     try:
         sent_resp = supabase.table(TABLE_SENTIMENT).select("*").execute()
@@ -502,11 +712,9 @@ def get_sell_candidates(balance: Optional[dict] = None) -> dict:
     except Exception as e:
         logger.warning(f"매도 판단용 감성 조회 실패: {e}")
 
-    # 시장 환경
     market = kr_market_data_service.get_market_context()
     fear_index = market.get("kospi_vol_20d")
 
-    # 매수 시점의 ATR 익절/손절선
     trade_map: Dict[str, dict] = {}
     try:
         tr_resp = (
@@ -522,6 +730,7 @@ def get_sell_candidates(balance: Optional[dict] = None) -> dict:
         logger.warning(f"kr_trade_records 조회 실패 (고정비율 폴백): {e}")
 
     sell_candidates = []
+    trailing_updates = []
 
     for item in holdings:
         code = item.get("pdno", "")
@@ -537,136 +746,370 @@ def get_sell_candidates(balance: Optional[dict] = None) -> dict:
             continue
 
         change_pct = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
-        reasons: List[str] = []
-
-        # ── 조건 1: ATR 익절/손절 ─────────────────────────
         trade = trade_map.get(code)
-        if trade and trade.get("take_profit_price") and trade.get("stop_loss_price"):
+        tech = tech_map.get(code)
+        sentiment = sentiment_map.get(code)
+
+        atr = None
+        if trade:
+            try:
+                atr = float(trade.get("atr")) if trade.get("atr") is not None else None
+            except (ValueError, TypeError):
+                atr = None
+
+        action = None  # (exit_type, reason_code, reasons, sell_qty)
+
+        if trade and trade.get("take_profit_price") and trade.get("stop_loss_price") and atr:
             tp = float(trade["take_profit_price"])
             sl = float(trade["stop_loss_price"])
-            if current_price >= tp:
-                reasons.append(
-                    f"ATR 익절: 현재가 {current_price:,.0f}원 >= 익절가 {tp:,.0f}원 "
-                    f"(매입가 대비 {change_pct:+.2f}%)"
+            partial_done = bool(trade.get("partial_exit_done"))
+
+            if partial_done:
+                # 샹들리에 트레일링 — 진입시점 ATR 고정, 고점 대비 배수. 래칫(상향만).
+                stored_peak = trade.get("chandelier_peak_price")
+                peak = max(
+                    float(stored_peak) if stored_peak is not None else current_price,
+                    current_price,
                 )
-            elif current_price <= sl:
-                reasons.append(
-                    f"ATR 손절: 현재가 {current_price:,.0f}원 <= 손절가 {sl:,.0f}원 "
-                    f"(매입가 대비 {change_pct:+.2f}%)"
+                candidate_stop = peak - settings.KR_CHANDELIER_ATR_MULT * atr
+                stored_stop = trade.get("chandelier_stop_price")
+                stop = max(
+                    float(stored_stop) if stored_stop is not None else float("-inf"),
+                    candidate_stop,
+                    sl,  # 손절선 아래로는 내려가지 않는다
                 )
-        else:
-            if change_pct >= FALLBACK_TAKE_PROFIT_PCT:
-                reasons.append(f"익절(고정비율): 매입가 대비 {change_pct:+.2f}%")
-            elif change_pct <= FALLBACK_STOP_LOSS_PCT:
-                reasons.append(f"손절(고정비율): 매입가 대비 {change_pct:+.2f}%")
-
-        # ── 조건 2: 기술적 매도 신호 ──────────────────────
-        tech = tech_map.get(code)
-        signal_count = 0
-        signal_details: List[str] = []
-        adx_value = None
-
-        if tech:
-            if not tech.get("골든_크로스"):
-                signal_count += 1
-                signal_details.append("데드 크로스")
-
-            try:
-                rsi_val = float(tech.get("RSI", 50) or 50)
-                if rsi_val > 70:
-                    signal_count += 1
-                    signal_details.append(f"RSI 과매수({rsi_val:.1f})")
-            except (ValueError, TypeError):
-                pass
-
-            if not tech.get("MACD_매수_신호"):
-                signal_count += 1
-                signal_details.append("MACD 매도 신호")
-
-            # 패닉셀: 거래량 2배 이상 + 당일 -3% 이상
-            try:
-                vr = tech.get("volume_ratio")
-                dc = tech.get("daily_change_pct")
-                if vr is not None and dc is not None and float(vr) >= 2.0 and float(dc) <= -3:
-                    signal_count += 1
-                    signal_details.append(
-                        f"패닉셀(거래량 {float(vr):.1f}배, 당일 {float(dc):.1f}%)"
+                trailing_updates.append(
+                    {
+                        "trade_id": trade.get("id"),
+                        "code": code,
+                        "peak_price": peak,
+                        "stop_price": stop,
+                    }
+                )
+                if current_price <= stop:
+                    action = (
+                        "full",
+                        "chandelier_stop",
+                        [
+                            f"샹들리에 트레일링 이탈: 현재가 {current_price:,.0f}원 <= "
+                            f"트레일링 스탑 {stop:,.0f}원 (고점 {peak:,.0f}원 대비 "
+                            f"{settings.KR_CHANDELIER_ATR_MULT:.1f}×ATR, 매입가 대비 {change_pct:+.2f}%)"
+                        ],
+                        quantity,
                     )
-            except (ValueError, TypeError):
-                pass
-
-            # 수급 이탈: 외국인+기관 5일 순매도 (한국 시장 전용 신호)
-            try:
-                nb = tech.get("net_buy_5d")
-                if nb is not None and float(nb) < 0:
-                    signal_count += 1
-                    signal_details.append(f"외국인·기관 5일 순매도({float(nb):,.0f}백만원)")
-            except (ValueError, TypeError):
-                pass
-
-            try:
-                adx_value = float(tech["adx"]) if tech.get("adx") is not None else None
-            except (ValueError, TypeError):
-                adx_value = None
-
-        adx_adj = 1 if adx_value is not None and adx_value > 25 else 0
-        adx_note = f", ADX={adx_value:.1f} 보정" if adx_adj else ""
-
-        sentiment = sentiment_map.get(code)
-        sentiment_score = None
-        if sentiment:
-            try:
-                sentiment_score = float(sentiment.get("sentiment_score"))
-            except (ValueError, TypeError):
-                sentiment_score = None
-
-        required_3 = 3 - adx_adj
-        if signal_count >= required_3:
-            reasons.append(
-                f"기술적 매도 신호 {signal_count}/{required_3}개: "
-                f"{', '.join(signal_details)}{adx_note}"
-            )
-        elif sentiment_score is not None and sentiment_score < -0.15:
-            required_2 = 2 - adx_adj
-            if signal_count >= required_2:
-                reasons.append(
-                    f"부정적 감성({sentiment_score:.2f}) + 매도 신호 "
-                    f"{signal_count}/{required_2}개: {', '.join(signal_details)}{adx_note}"
+            elif current_price <= sl:
+                action = (
+                    "full",
+                    "stop_loss",
+                    [
+                        f"ATR 손절: 현재가 {current_price:,.0f}원 <= 손절가 {sl:,.0f}원 "
+                        f"(매입가 대비 {change_pct:+.2f}%)"
+                    ],
+                    quantity,
+                )
+            elif current_price >= tp:
+                partial_qty = int(quantity * settings.KR_PARTIAL_SELL_RATIO)
+                if partial_qty < settings.KR_MIN_PARTIAL_SHARES or quantity - partial_qty < 1:
+                    action = (
+                        "full",
+                        "take_profit",
+                        [
+                            f"ATR 익절(전량 — 부분매도 수량 미달): 현재가 {current_price:,.0f}원 >= "
+                            f"익절가 {tp:,.0f}원 (매입가 대비 {change_pct:+.2f}%)"
+                        ],
+                        quantity,
+                    )
+                else:
+                    action = (
+                        "partial",
+                        "partial_take_profit",
+                        [
+                            f"ATR 부분익절({settings.KR_PARTIAL_SELL_RATIO:.0%}): 현재가 "
+                            f"{current_price:,.0f}원 >= 익절가 {tp:,.0f}원 (매입가 대비 "
+                            f"{change_pct:+.2f}%) — 잔량은 샹들리에 트레일링으로 전환"
+                        ],
+                        partial_qty,
+                    )
+        else:
+            # 레거시(ATR/거래기록 없음) — 고정비율 전량 익절/손절만
+            if change_pct >= FALLBACK_TAKE_PROFIT_PCT:
+                action = (
+                    "full",
+                    "take_profit",
+                    [f"익절(고정비율): 매입가 대비 {change_pct:+.2f}%"],
+                    quantity,
+                )
+            elif change_pct <= FALLBACK_STOP_LOSS_PCT:
+                action = (
+                    "full",
+                    "stop_loss",
+                    [f"손절(고정비율): 매입가 대비 {change_pct:+.2f}%"],
+                    quantity,
                 )
 
-        # ── 조건 3: 공포장 ────────────────────────────────
-        if fear_index is not None and signal_count >= 1:
-            if fear_index > 40:
-                reasons.append(
-                    f"극단적 공포(변동성 {fear_index:.1f}%) + 매도 신호 {signal_count}개: "
-                    f"{', '.join(signal_details)}"
-                )
-            elif fear_index > 30 and signal_count >= 2:
-                reasons.append(
-                    f"공포 시장(변동성 {fear_index:.1f}%) + 매도 신호 {signal_count}개: "
-                    f"{', '.join(signal_details)}"
-                )
+        # ── 조건 2/3 (조건 1 이 이미 발동했으면 건너뜀) ──────
+        sig = _technical_sell_signals(tech, sentiment, fear_index)
+        if action is None and sig["reasons"]:
+            action = ("full", _reason_code_from_signal_details(sig["signal_details"]), sig["reasons"], quantity)
 
-        if reasons:
-            sell_candidates.append(
-                {
-                    "code": code,
-                    "stock_name": name,
-                    "quantity": quantity,
-                    "buy_price": buy_price,
-                    "current_price": current_price,
-                    "price_change_percent": round(change_pct, 2),
-                    "sell_reasons": reasons,
-                    "technical_sell_signals": signal_count,
-                    "technical_sell_details": signal_details or None,
-                    "sentiment_score": sentiment_score,
-                    "adx": adx_value,
-                    "fear_index": fear_index,
-                }
-            )
+        if action is None:
+            continue
+
+        exit_type, reason_code, reasons, sell_qty = action
+        sell_candidates.append(
+            {
+                "code": code,
+                "stock_name": name,
+                "quantity": sell_qty,
+                "full_quantity": quantity,
+                "exit_type": exit_type,
+                "reason_code": reason_code,
+                "trade_id": trade.get("id") if trade else None,
+                "realized_partial_pnl": float(trade.get("realized_partial_pnl") or 0) if trade else 0.0,
+                "realized_partial_qty": int(trade.get("realized_partial_qty") or 0) if trade else 0,
+                "buy_price": buy_price,
+                "current_price": current_price,
+                "price_change_percent": round(change_pct, 2),
+                "sell_reasons": reasons,
+                "technical_sell_signals": sig["signal_count"],
+                "technical_sell_details": sig["signal_details"] or None,
+                "sentiment_score": sig["sentiment_score"],
+                "adx": sig["adx_value"],
+                "fear_index": fear_index,
+            }
+        )
 
     sell_candidates.sort(key=lambda x: abs(x["price_change_percent"]), reverse=True)
     return {
         "message": f"{len(sell_candidates)}개의 매도 대상을 식별했습니다",
         "sell_candidates": sell_candidates,
+        "trailing_updates": trailing_updates,
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# 5) LLM 매도검토용 정성적 컨텍스트
+# ══════════════════════════════════════════════════════════════════
+
+def get_score_trend(code: str, days: int = 5, since: Optional[str] = None) -> List[dict]:
+    """
+    최근 N일 LLM 매도검토 로그(kr_llm_sell_decision_logs)에서 이 종목의 점수/순위 추이를 가져온다.
+
+    "하루짜리 노이즈인지 추세적 악화인지 구분하라"는 지시를 LLM 이 실제로 수행할 수 있게
+    하려면 스냅샷 하나가 아니라 이력이 필요하다 — 매일 쌓이는 이 로그를 그대로 재활용한다.
+    새 데이터 수집 없이 과거 판단 기록만 조회하므로 비용이 없다.
+
+    since 를 주면(보통 이번 매수의 buy_date) 그 날짜 이후 기록만 본다 — 같은 종목을 예전에
+    샀다 판 이력까지 섞여서 "지금 보유분의 추세"인 것처럼 보이는 걸 막는다.
+
+    kr_llm_sell_decision_logs 는 append-only 라 하루에 여러 행이 쌓일 수 있다(장중 추가
+    매도검토 반복 실행). "N 일치 추이"는 날짜 단위여야 의미가 있으므로, 하루에 여러 행이 있으면
+    그 날의 가장 최신(created_at) 행 하나만 남기고 나머지는 버린다.
+    """
+    try:
+        query = (
+            supabase.table("kr_llm_sell_decision_logs")
+            .select("decision_date,composite_score,score_rank,score_universe_size,created_at")
+            .eq("code", code)
+        )
+        if since:
+            query = query.gte("decision_date", since[:10])
+        # 하루에 여러 행이 쌓일 수 있어 넉넉히 가져온 뒤 날짜별 최신 행만 남긴다
+        resp = (
+            query.order("decision_date", desc=True)
+            .order("created_at", desc=True)
+            .limit(days * 20)
+            .execute()
+        )
+        raw_rows = resp.data or []
+    except Exception as e:
+        logger.warning(f"  {universe.display(code)} 점수 추세 조회 실패: {e}")
+        return []
+
+    latest_by_date: Dict[str, dict] = {}
+    for r in raw_rows:  # 날짜 desc, 같은 날짜 안에서는 created_at desc 라 첫 등장이 그날의 최신
+        d = r["decision_date"]
+        if d not in latest_by_date:
+            latest_by_date[d] = r
+
+    rows = sorted(latest_by_date.values(), key=lambda r: r["decision_date"])[-days:]
+    return rows
+
+
+def get_llm_sell_context(balance: Optional[dict] = None) -> dict:
+    """
+    보유 종목별 점수 추이(감쇠)·팩터반전 상세·교체매매 후보를 모아 LLM 매도검토 입력으로 만든다.
+
+    기계적 손절/부분익절/샹들리에/기술신호개수/공포장 규칙은 이 함수와 무관하게 항상 별도로
+    실행되므로, 여기서는 그 위에 얹을 정성적 판단 재료만 준비한다.
+    """
+    if balance is None:
+        balance = kis.get_balance()
+    if balance.get("rt_cd") != "0":
+        return {"message": f"잔고 조회 실패: {balance.get('msg1', '')}", "holdings": [], "market": {}}
+
+    holdings = balance.get("output1", [])
+    if not holdings:
+        return {"message": "보유 종목이 없습니다", "holdings": [], "market": {}}
+
+    held_codes = [h.get("pdno") for h in holdings if h.get("pdno")]
+    extra_codes = [c for c in held_codes if c not in universe.CODE_TO_NAME]
+
+    scored = get_scored_universe(extra_codes=extra_codes)
+    scored_map = scored["scored"]
+    market = scored["market"]
+    fear_index = market.get("kospi_vol_20d")
+
+    tech_map, _, sentiment_map = _load_candidate_maps()
+
+    trade_map: Dict[str, dict] = {}
+    try:
+        tr_resp = (
+            supabase.table(TABLE_TRADES)
+            .select("*")
+            .eq("status", "holding")
+            .eq("account_type", kis.current_account_type())
+            .execute()
+        )
+        for tr in tr_resp.data or []:
+            trade_map[tr["code"]] = tr
+    except Exception as e:
+        logger.warning(f"kr_trade_records 조회 실패: {e}")
+
+    # 교체매매 후보 — 오늘 매수 후보 중 미보유 최상위 종목.
+    # 국내 매수가 스위치로 꺼져 있으면 대기 후보를 애초에 살 수 없으므로, 로테이션 이유로
+    # 보유종목을 파는 것 자체가 앞뒤가 안 맞는다 — 후보 산출(비용 드는 채점)까지 건너뛴다.
+    best_waiting = None
+    at_capacity = False
+    if market_switch_service.is_buy_enabled("KR"):
+        buy_result = get_buy_candidates()
+        unheld_candidates = [c for c in buy_result.get("results", []) if c["code"] not in held_codes]
+        best_waiting = unheld_candidates[0] if unheld_candidates else None
+        at_capacity = len(held_codes) >= settings.KR_MAX_POSITIONS
+
+    context_list = []
+    for item in holdings:
+        code = item.get("pdno", "")
+        name = item.get("prdt_name", code)
+        try:
+            quantity = int(item.get("hldg_qty", 0) or 0)
+            buy_price = float(item.get("pchs_avg_pric", 0) or 0)
+            current_price = float(item.get("prpr", 0) or 0)
+        except (ValueError, TypeError):
+            continue
+        if quantity <= 0:
+            continue
+
+        change_pct = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
+        trade = trade_map.get(code)
+        scored_entry = scored_map.get(code)
+        sig = _technical_sell_signals(tech_map.get(code), sentiment_map.get(code), fear_index)
+
+        # 활성 손절/트레일링선까지 남은 여유, 1차 익절선까지 남은 폭 — LLM 이 "지금 내 판단이
+        # 실제로 얼마나 중요한지"(기계적 안전망이 곧 작동할지 여부)를 가늠할 수 있게 한다.
+        stop_distance_pct = None
+        take_profit_distance_pct = None
+        if trade and current_price > 0:
+            active_stop = None
+            if trade.get("partial_exit_done") and trade.get("chandelier_stop_price"):
+                active_stop = trade.get("chandelier_stop_price")
+            elif trade.get("stop_loss_price"):
+                active_stop = trade.get("stop_loss_price")
+            if active_stop:
+                stop_distance_pct = round((current_price - float(active_stop)) / current_price * 100, 2)
+            if not trade.get("partial_exit_done") and trade.get("take_profit_price"):
+                take_profit_distance_pct = round(
+                    (float(trade["take_profit_price"]) - current_price) / current_price * 100, 2
+                )
+
+        rotation_flag = False
+        rotation_candidate = None
+        if (
+            at_capacity
+            and best_waiting is not None
+            and scored_entry is not None
+            and best_waiting["composite_score"] - scored_entry["composite_score"]
+            >= settings.KR_ROTATION_MIN_SCORE_GAP
+        ):
+            rotation_flag = True
+            rotation_candidate = {
+                "code": best_waiting["code"],
+                "stock_name": best_waiting.get("stock_name"),
+                "composite_score": best_waiting["composite_score"],
+            }
+
+        context_list.append(
+            {
+                "code": code,
+                "stock_name": name,
+                "quantity": quantity,
+                "buy_price": buy_price,
+                "current_price": current_price,
+                "price_change_percent": round(change_pct, 2),
+                "composite_score": scored_entry.get("composite_score") if scored_entry else None,
+                "score_rank": scored_entry.get("rank") if scored_entry else None,
+                "score_universe_size": scored.get("universe_size"),
+                "score_note": (scored_entry or {}).get("score_note"),
+                "score_trend": get_score_trend(
+                    code, settings.KR_SCORE_TREND_DAYS, since=(trade or {}).get("buy_date")
+                ),
+                "technical_sell_signals": sig["signal_count"],
+                "technical_sell_details": sig["signal_details"],
+                "sentiment_score": sig["sentiment_score"],
+                "adx": sig["adx_value"],
+                "fear_index": fear_index,
+                "partial_exit_done": bool(trade.get("partial_exit_done")) if trade else False,
+                "realized_partial_qty": int((trade or {}).get("realized_partial_qty") or 0),
+                "chandelier_stop_price": (trade or {}).get("chandelier_stop_price"),
+                "atr": (trade or {}).get("atr"),
+                "take_profit_price": (trade or {}).get("take_profit_price"),
+                "stop_loss_price": (trade or {}).get("stop_loss_price"),
+                "stop_distance_pct": stop_distance_pct,
+                "take_profit_distance_pct": take_profit_distance_pct,
+                "rotation_flag": rotation_flag,
+                "rotation_candidate": rotation_candidate,
+            }
+        )
+
+    return {
+        "message": f"{len(context_list)}개 보유종목 컨텍스트를 생성했습니다",
+        "holdings": context_list,
+        "market": market,
+    }
+
+
+def get_current_signal_count(code: str) -> Optional[int]:
+    """
+    한 종목의 현재 기술적 매도신호 개수만 가볍게 계산한다 (LLM 매도판정 집행 시 근거 재검증용).
+
+    get_llm_sell_context() 처럼 전체 유니버스를 로드하지 않고 이 종목 하나만 조회한다 —
+    실행 시점에 "판단 때보다 신호가 줄었는지(근거 개선)"만 싸게 확인하면 되기 때문이다.
+    """
+    try:
+        tech_resp = (
+            supabase.table(TABLE_TECH)
+            .select("*")
+            .eq("code", code)
+            .order("날짜", desc=True)
+            .limit(1)
+            .execute()
+        )
+        tech = (tech_resp.data or [None])[0]
+    except Exception as e:
+        logger.warning(f"  {universe.display(code)} 재검증용 기술지표 조회 실패: {e}")
+        tech = None
+
+    sentiment = None
+    try:
+        sent_resp = supabase.table(TABLE_SENTIMENT).select("*").eq("code", code).limit(1).execute()
+        sentiment = (sent_resp.data or [None])[0]
+    except Exception as e:
+        logger.warning(f"  {universe.display(code)} 재검증용 감성 조회 실패: {e}")
+
+    try:
+        fear_index = kr_market_data_service.get_market_context().get("kospi_vol_20d")
+    except Exception as e:
+        logger.warning(f"  재검증용 시장환경 조회 실패: {e}")
+        fear_index = None
+
+    return _technical_sell_signals(tech, sentiment, fear_index)["signal_count"]

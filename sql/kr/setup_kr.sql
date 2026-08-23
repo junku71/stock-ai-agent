@@ -322,6 +322,24 @@ CREATE INDEX IF NOT EXISTS idx_kr_trades_buy_date ON kr_trade_records (buy_date 
 
 
 -- ───────────────────────────────────────────────────────────────
+-- 1-7b) kr_trade_records 확장 — 부분익절 + 샹들리에 트레일링
+--       status 에 'partial_sell_ordered' 값이 추가된다 (TEXT 자유값이라 스키마 변경 불필요).
+--       진행: holding → (부분익절 도달 시) partial_sell_ordered → holding(partial_exit_done=TRUE)
+--             → (샹들리에 이탈 또는 손절) sell_ordered → sold
+-- ───────────────────────────────────────────────────────────────
+ALTER TABLE kr_trade_records ADD COLUMN IF NOT EXISTS partial_exit_done     BOOLEAN DEFAULT FALSE;
+ALTER TABLE kr_trade_records ADD COLUMN IF NOT EXISTS pending_partial_qty   INT;
+ALTER TABLE kr_trade_records ADD COLUMN IF NOT EXISTS chandelier_peak_price FLOAT8;
+ALTER TABLE kr_trade_records ADD COLUMN IF NOT EXISTS chandelier_stop_price FLOAT8;
+ALTER TABLE kr_trade_records ADD COLUMN IF NOT EXISTS realized_partial_pnl  FLOAT8 DEFAULT 0;
+ALTER TABLE kr_trade_records ADD COLUMN IF NOT EXISTS realized_partial_qty  INT DEFAULT 0;
+
+-- kr_llm_sell_decision_logs 가 이미 존재하는 설치본을 위한 컬럼 추가 (신규 설치는 CREATE TABLE 에 이미 포함)
+ALTER TABLE kr_llm_sell_decision_logs ADD COLUMN IF NOT EXISTS price_at_decision FLOAT8;
+ALTER TABLE kr_llm_sell_decision_logs ADD COLUMN IF NOT EXISTS signal_count_at_decision INT;
+
+
+-- ───────────────────────────────────────────────────────────────
 -- 1-8) kr_llm_decision_logs — LLM 최종 검토 판단 기록
 --      (decision_date, code) 유니크 → 같은 날 재실행 시 upsert
 -- ───────────────────────────────────────────────────────────────
@@ -347,6 +365,52 @@ CREATE TABLE IF NOT EXISTS kr_llm_decision_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_kr_llm_date ON kr_llm_decision_logs (decision_date DESC);
+
+
+-- ───────────────────────────────────────────────────────────────
+-- 1-8b) kr_llm_sell_decision_logs — 보유 종목 LLM 매도 검토 판단 기록
+--       append-only 로그다 — (decision_date, code) 당 여러 행이 쌓일 수 있다(장중 추가
+--       매도검토가 같은 날 반복 실행되기 때문). 항상 INSERT 만 하고, 유니크 제약을 두지
+--       않는다 — 그래야 하루 안에서 판단이 바뀐 과정(예: 11:05 HOLD -> 13:05 SELL_PARTIAL)이
+--       덮어써지지 않고 그대로 남는다. 읽는 쪽은 (decision_date, code) 별 가장 최신
+--       (created_at 기준) 행만 "오늘의 유효 판단"으로 취급한다.
+--       기계적 손절/부분익절/샹들리에는 이 표와 무관하게 항상 별도로 실행된다.
+-- ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS kr_llm_sell_decision_logs (
+    id                       BIGSERIAL PRIMARY KEY,
+    decision_date            DATE NOT NULL,
+    code                     TEXT NOT NULL,
+    stock_name               TEXT,
+    decision                 TEXT,        -- HOLD / SELL_ALL / SELL_PARTIAL / FAIL / N/A
+    reason                   TEXT,
+    market_analysis          TEXT,
+    composite_score          FLOAT8,
+    score_rank               INT,
+    score_universe_size      INT,
+    factor_reversals         TEXT,
+    sentiment_score          FLOAT8,
+    rotation_flag            BOOLEAN DEFAULT FALSE,
+    rotation_candidate_code  TEXT,
+    rotation_candidate_score FLOAT8,
+    price_at_decision        FLOAT8,   -- 판단 시점 현재가 (집행 시점 재검증용)
+    signal_count_at_decision INT,      -- 판단 시점 기술적 매도신호 개수 (집행 시점 근거 재검증용)
+    -- pending(집행 대기) / executed(주문 접수) / skipped(기계적 처리와 충돌해 건너뜀) / expired(다음날 재검토로 폐기)
+    status                   TEXT NOT NULL DEFAULT 'pending',
+    executed_at              TIMESTAMPTZ,
+    created_at               TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 기존 설치본에 유니크 제약이 남아있으면 제거한다 (append-only 로 전환 — 위 설명 참조)
+ALTER TABLE kr_llm_sell_decision_logs DROP CONSTRAINT IF EXISTS uq_kr_llm_sell_decision;
+-- append-only 라 행이 다시 업데이트되지 않아 created_at 과 항상 같아지는 죽은 컬럼 — 제거
+ALTER TABLE kr_llm_sell_decision_logs DROP COLUMN IF EXISTS updated_at;
+
+CREATE INDEX IF NOT EXISTS idx_kr_llm_sell_date ON kr_llm_sell_decision_logs (decision_date DESC);
+CREATE INDEX IF NOT EXISTS idx_kr_llm_sell_pending
+    ON kr_llm_sell_decision_logs (status, decision_date DESC);
+-- (decision_date, code) 별 "가장 최신 행" 조회 패턴 전용 인덱스
+CREATE INDEX IF NOT EXISTS idx_kr_llm_sell_code_date_created
+    ON kr_llm_sell_decision_logs (code, decision_date DESC, created_at DESC);
 
 
 -- ───────────────────────────────────────────────────────────────
@@ -444,6 +508,7 @@ ALTER TABLE kr_news_articles                 DISABLE ROW LEVEL SECURITY;
 ALTER TABLE kr_buy_queue                     DISABLE ROW LEVEL SECURITY;
 ALTER TABLE kr_trade_records                 DISABLE ROW LEVEL SECURITY;
 ALTER TABLE kr_llm_decision_logs             DISABLE ROW LEVEL SECURITY;
+ALTER TABLE kr_llm_sell_decision_logs        DISABLE ROW LEVEL SECURITY;
 ALTER TABLE kr_fear_gate_overrides           DISABLE ROW LEVEL SECURITY;
 
 GRANT ALL ON ALL TABLES    IN SCHEMA public TO anon, authenticated, service_role;
@@ -474,4 +539,5 @@ UNION ALL SELECT 'kr_news_articles',             COUNT(*) FROM kr_news_articles
 UNION ALL SELECT 'kr_buy_queue',                 COUNT(*) FROM kr_buy_queue
 UNION ALL SELECT 'kr_trade_records',             COUNT(*) FROM kr_trade_records
 UNION ALL SELECT 'kr_llm_decision_logs',         COUNT(*) FROM kr_llm_decision_logs
+UNION ALL SELECT 'kr_llm_sell_decision_logs',    COUNT(*) FROM kr_llm_sell_decision_logs
 UNION ALL SELECT 'kr_fear_gate_overrides',       COUNT(*) FROM kr_fear_gate_overrides;

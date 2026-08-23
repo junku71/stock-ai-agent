@@ -143,6 +143,38 @@ class Settings(BaseSettings):
     #   5년이면 코로나 이후 국면 + 금리 인상/인하 사이클을 포함한다.
     KR_HISTORY_YEARS: int = int(os.getenv("KR_HISTORY_YEARS", "5"))
 
+    # ── 매도 전략: 부분익절 + 샹들리에 트레일링 + 교체매매 ──
+    # 2.5×ATR 익절가 도달 시 전량매도 대신 일부만 팔고, 잔량은 진입 시점 ATR 로 고정한
+    # 샹들리에(고점 대비 배수) 트레일링 스탑으로 넘긴다. 손절/기존 기술신호·공포장 규칙은 그대로 유지.
+    KR_CHANDELIER_ATR_MULT: float = float(os.getenv("KR_CHANDELIER_ATR_MULT", "3.0"))
+    KR_PARTIAL_SELL_RATIO: float = float(os.getenv("KR_PARTIAL_SELL_RATIO", "0.3"))
+    # 부분익절 수량이 이 값 미만이면 부분매도 대신 전량매도로 대체 (소량 잔량 방지)
+    KR_MIN_PARTIAL_SHARES: int = int(os.getenv("KR_MIN_PARTIAL_SHARES", "1"))
+    # 교체매매: 대기 중인 미보유 후보 점수가 가장 약한 보유종목 점수보다 이 값 이상 높고
+    # 보유종목수가 KR_MAX_POSITIONS 에 도달했을 때만 LLM 매도검토에 교체후보로 표시한다.
+    KR_ROTATION_MIN_SCORE_GAP: float = float(os.getenv("KR_ROTATION_MIN_SCORE_GAP", "0.30"))
+
+    # LLM 매도검토 프롬프트에 보여줄 점수/순위 추세 일수. "하루짜리 노이즈 vs 추세적 악화"를
+    # 실제로 구분할 수 있게 kr_llm_sell_decision_logs 이력을 며칠치 보여줄지 결정한다.
+    KR_SCORE_TREND_DAYS: int = int(os.getenv("KR_SCORE_TREND_DAYS", "5"))
+
+    # LLM 매도판정 집행 재검증 임계값(%). 판단 시점(price_at_decision) 대비 현재가가 이 값
+    # 이상 유리한 방향(상승)으로 이미 움직였으면, 판단이 낡았다고 보고 이번 사이클 집행을
+    # 보류한다(취소가 아니라 다음 사이클에 다시 검사). 0 이하로 두면 재검증을 끈다.
+    KR_SELL_REVALIDATE_PCT: float = float(os.getenv("KR_SELL_REVALIDATE_PCT", "3.0"))
+
+    # 장중 추가 매도검토(조건부 주기체크): 공포지수가 이 값을 넘는 날은, 마지막 매도검토 이후
+    # KR_INTRADAY_REVIEW_INTERVAL_HOURS 시간마다 LLM 매도검토를 한 번 더 돌린다. 공포지수는
+    # 장 마감 후에만 갱신되므로 "장중에 막 넘어선 순간"은 관측 불가 — 그래서 이벤트 트리거가
+    # 아니라 "오늘 이미 넘어선 상태가 지속되는 동안 주기적으로 재점검"하는 방식이다.
+    # 0 이하로 두면 끈다.
+    KR_INTRADAY_FEAR_REVIEW_THRESHOLD: float = float(
+        os.getenv("KR_INTRADAY_FEAR_REVIEW_THRESHOLD", "40.0")
+    )
+    KR_INTRADAY_REVIEW_INTERVAL_HOURS: float = float(
+        os.getenv("KR_INTRADAY_REVIEW_INTERVAL_HOURS", "2")
+    )
+
     # 분석 파이프라인(장 마감 후) / 매수 집행(장 시작 후) 시각 — 모두 KST
     KR_ANALYSIS_TIME: str = os.getenv("KR_ANALYSIS_TIME", "16:30")
     KR_EXECUTION_TIME: str = os.getenv("KR_EXECUTION_TIME", "09:05")

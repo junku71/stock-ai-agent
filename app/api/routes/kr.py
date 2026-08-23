@@ -17,6 +17,7 @@ from app.utils.kr_scheduler import (
     run_analysis_now,
     run_auto_sell_now,
     run_buy_execution_now,
+    run_sell_review_now,
     start_kr_scheduler,
     stop_kr_scheduler,
 )
@@ -180,12 +181,31 @@ def buy_candidates():
         raise HTTPException(status_code=500, detail=f"매수 후보 조회 오류: {e}")
 
 
-@router.get("/candidates/sell", summary="매도 후보 조회")
+@router.get("/candidates/sell", summary="매도 후보 조회 (기계적 규칙)")
 def sell_candidates():
+    """ATR 손절 / 부분익절+샹들리에 트레일링 / 기술신호개수 / 공포장 — LLM 과 무관하게 항상 실행."""
     try:
-        return recommend.get_sell_candidates()
+        return recommend.get_mechanical_sell_candidates()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"매도 후보 조회 오류: {e}")
+
+
+@router.get("/candidates/scored-universe", summary="유니버스 전체 채점 (임계값 컷 없음, 디버깅용)")
+def scored_universe():
+    """보유종목 점수감쇠 판단에 쓰는 피어 그룹 채점 결과. get_buy_candidates() 와 달리 필터가 없다."""
+    try:
+        return recommend.get_scored_universe()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"점수 유니버스 조회 오류: {e}")
+
+
+@router.get("/holdings/sell-review", summary="보유 종목 LLM 매도검토 컨텍스트 조회 (LLM 호출 없음)")
+def holdings_sell_review():
+    """점수 추이/팩터반전/교체매매 후보 등 LLM 매도검토에 들어갈 입력만 확인한다."""
+    try:
+        return recommend.get_llm_sell_context()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"매도검토 컨텍스트 조회 오류: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -285,8 +305,19 @@ def execute_buy(
 
 @router.post("/pipeline/execute-sell", summary="매도 판단 즉시 실행")
 def execute_sell():
+    """기계적 규칙(손절/부분익절+샹들리에/기술신호개수/공포장) + 전날 LLM 매도검토 미집행 판정을 실행."""
     run_auto_sell_now()
     return {"message": "매도 판단을 백그라운드에서 시작했습니다"}
+
+
+@router.post("/pipeline/execute-sell-review", summary="보유 종목 LLM 매도검토 즉시 실행")
+def execute_sell_review():
+    """
+    HOLD/SELL_ALL/SELL_PARTIAL 판정만 내려 kr_llm_sell_decision_logs 에 저장한다.
+    실제 매도 주문은 이후 매도 감시 사이클(/pipeline/execute-sell)에서 집행된다.
+    """
+    run_sell_review_now()
+    return {"message": "보유 종목 LLM 매도검토를 백그라운드에서 시작했습니다"}
 
 
 # ══════════════════════════════════════════════════════════════════

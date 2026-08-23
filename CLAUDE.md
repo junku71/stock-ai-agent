@@ -119,10 +119,17 @@ Scheduling: schedule, APScheduler
 ### 테이블
 `kr_economic_and_stock_data`, `kr_stock_recommendations`, `kr_stock_analysis_results`,
 `kr_ticker_sentiment_analysis`, `kr_news_articles`, `kr_buy_queue`, `kr_trade_records`,
-`kr_llm_decision_logs`, `kr_fear_gate_overrides` (DDL: `sql/kr/setup_kr.sql` — 멱등, 재실행 안전)
+`kr_llm_decision_logs`, `kr_llm_sell_decision_logs`, `kr_fear_gate_overrides`
+(DDL: `sql/kr/setup_kr.sql` — 멱등, 재실행 안전)
 
 ### 추가 환경 변수
 `KR_ENABLED`, `KR_DRY_RUN`, `KR_SLOT_RATIO`, `KR_MAX_POSITIONS`,
 `KR_ANALYSIS_TIME`, `KR_EXECUTION_TIME`, `NAVER_API_KEY_ID`, `NAVER_API_KEY`,
 `NAVER_API_HUB_BASE`, `KR_SENTIMENT_MODEL`, `ECOS_API_KEY`, `KRX_AUTH_KEY`,
-`DART_API_KEY`, `KAGGLE_KERNEL_SLUG_KR`, `KAGGLE_NOTEBOOK_DIR_KR`
+`DART_API_KEY`, `KAGGLE_KERNEL_SLUG_KR`, `KAGGLE_NOTEBOOK_DIR_KR`,
+`KR_CHANDELIER_ATR_MULT`(기본 3.0), `KR_PARTIAL_SELL_RATIO`(기본 0.3),
+`KR_MIN_PARTIAL_SHARES`(기본 1), `KR_ROTATION_MIN_SCORE_GAP`(기본 0.30),
+`KR_SCORE_TREND_DAYS`(기본 5), `KR_SELL_REVALIDATE_PCT`(기본 3.0),
+`KR_INTRADAY_FEAR_REVIEW_THRESHOLD`(기본 40.0), `KR_INTRADAY_REVIEW_INTERVAL_HOURS`(기본 2) —
+매도전략(부분익절+샹들리에 트레일링, 교체매매, LLM 판단 품질 보강, 장중 추가 매도검토) 관련. 자세한
+설명은 `documents/20_국내주식_KOSPI30_설계.md` 6장 참조
