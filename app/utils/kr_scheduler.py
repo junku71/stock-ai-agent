@@ -1322,9 +1322,50 @@ class KrScheduler:
             try:
                 if status == "buy_ordered":
                     if kis_qty > 0:
-                        supabase.table(TABLE_TRADES).update(
-                            {"status": "holding", "holding_quantity": kis_qty}
-                        ).eq("id", rec_id).execute()
+                        # 체결가 동기화 — buy_price 는 매수 시점엔 '주문가'로 들어간다.
+                        # 지정가 주문이 더 유리한 값에 체결되면 원장(pchs_avg_pric)과 어긋나는데,
+                        # 매도 시 손익은 원장 기준으로 계산하므로 그대로 두면 기록상
+                        # "22,700 매수 → 22,650 매도, 손익 0원" 같은 모순이 남는다.
+                        # 익절/손절선도 주문가 기준으로 잡혀 있으므로 체결가 기준으로 다시 맞춘다
+                        # (ATR 배수라는 원래 의도를 체결가에 대해 보존).
+                        update_fields = {"status": "holding", "holding_quantity": kis_qty}
+                        try:
+                            fill_price = float(
+                                kis_holdings[code]["item"].get("pchs_avg_pric", 0) or 0
+                            )
+                        except (ValueError, TypeError, KeyError):
+                            fill_price = 0.0
+
+                        ordered_price = float(rec.get("buy_price") or 0)
+                        if fill_price > 0 and fill_price != ordered_price:
+                            update_fields["buy_price"] = fill_price
+                            try:
+                                rec_atr = float(rec["atr"]) if rec.get("atr") is not None else None
+                            except (ValueError, TypeError):
+                                rec_atr = None
+                            if rec_atr and rec_atr > 0:
+                                update_fields["take_profit_price"] = kis.round_to_tick(
+                                    fill_price + rec_atr * recommend.ATR_TAKE_PROFIT_MULT,
+                                    mode="down",
+                                )
+                                update_fields["stop_loss_price"] = kis.round_to_tick(
+                                    fill_price - rec_atr * recommend.ATR_STOP_LOSS_MULT,
+                                    mode="up",
+                                )
+                            logger.info(
+                                f"  {name}({code}) 체결가 동기화: 주문 {ordered_price:,.0f}원 → "
+                                f"체결 {fill_price:,.0f}원"
+                                + (
+                                    f" (익절 {update_fields['take_profit_price']:,}원 / "
+                                    f"손절 {update_fields['stop_loss_price']:,}원 재산출)"
+                                    if "take_profit_price" in update_fields
+                                    else ""
+                                )
+                            )
+
+                        supabase.table(TABLE_TRADES).update(update_fields).eq(
+                            "id", rec_id
+                        ).execute()
                         ordered_qty = rec.get("quantity") or 0
                         if kis_qty < ordered_qty:
                             logger.info(
@@ -1335,17 +1376,18 @@ class KrScheduler:
                             logger.info(f"  {name}({code}) 매수 체결 확인 → holding ({kis_qty}주)")
 
                         try:
-                            item = kis_holdings[code]["item"]
-                            fill = float(
-                                item.get("pchs_avg_pric", 0) or rec.get("buy_price") or 0
-                            )
+                            # 알림도 동기화된 값으로 — 재산출됐으면 그쪽이 실제 적용선이다
                             notify.notify_buy_filled(
                                 code=code,
                                 stock_name=name,
                                 qty=kis_qty,
-                                fill_price=fill,
-                                take_profit_price=rec.get("take_profit_price"),
-                                stop_loss_price=rec.get("stop_loss_price"),
+                                fill_price=fill_price or ordered_price,
+                                take_profit_price=update_fields.get(
+                                    "take_profit_price", rec.get("take_profit_price")
+                                ),
+                                stop_loss_price=update_fields.get(
+                                    "stop_loss_price", rec.get("stop_loss_price")
+                                ),
                                 composite_score=rec.get("composite_score"),
                             )
                         except Exception as e:

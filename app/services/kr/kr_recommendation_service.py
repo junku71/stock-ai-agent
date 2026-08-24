@@ -674,7 +674,8 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
               부분익절 미실행 + 익절가 도달 → 부분매도(KR_PARTIAL_SELL_RATIO), 잔량은 샹들리에로 전환
               (ATR/거래기록 없는 레거시 보유분은 고정비율 전량 익절/손절만)
       조건 2: 기술적 매도 신호 개수 (데드크로스/RSI>70/MACD매도/패닉셀/수급이탈, ADX 보정) → 전량매도
-      조건 3: 공포장(변동성>30+신호2개, >40+신호1개) → 전량매도
+      조건 3: 공포장(변동성>60+신호1개, >40+신호2개) → 전량매도
+              단 변동성 게이트가 수동 해제된 동안에는 조건 3 을 잠재운다 (아래 주석 참조)
 
     반환:
       sell_candidates — 각 항목에 exit_type("full"/"partial"), reason_code 포함
@@ -714,6 +715,24 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
 
     market = kr_market_data_service.get_market_context()
     fear_index = market.get("kospi_vol_20d")
+
+    # 공포장 강제청산(조건 3)은 매수 하드블록과 같은 축의 규칙이다 — 둘 다 "공포 국면이니
+    # 기계적으로 개입한다"는 판단이다. 운영자가 게이트를 수동 해제해 매수를 열어둔 동안
+    # 매도 쪽만 공포지수를 그대로 보면, 방금 매수한 포지션이 신호 1개에 즉시 전량청산돼
+    # 왕복매매가 난다 (실제로 2026-08-24 HMM 이 매수 1분 만에 청산됐다).
+    # 그래서 오버라이드가 살아 있는 동안에는 조건 3 만 잠재운다.
+    # ATR 손절/샹들리에 트레일링/부분익절(조건 1)과 기술신호 개수(조건 2)는 공포지수를
+    # 쓰지 않으므로 그대로 살아 있다 — 하방 방어가 사라지는 것이 아니다.
+    sell_override = kr_override_service.get_active_override()
+    mechanical_fear = fear_index
+    if sell_override is not None:
+        mechanical_fear = None
+        if fear_index is not None:
+            logger.info(
+                f"  변동성 게이트 수동 해제 중 — 공포장 강제청산 규칙 보류 "
+                f"(변동성 {fear_index:.1f}%, 사유: {sell_override.get('reason')}). "
+                f"손절/트레일링/기술신호 규칙은 그대로 적용됩니다"
+            )
 
     trade_map: Dict[str, dict] = {}
     try:
@@ -848,7 +867,8 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
                 )
 
         # ── 조건 2/3 (조건 1 이 이미 발동했으면 건너뜀) ──────
-        sig = _technical_sell_signals(tech, sentiment, fear_index)
+        # mechanical_fear 는 오버라이드 활성 시 None — 조건 3 만 비활성화된다
+        sig = _technical_sell_signals(tech, sentiment, mechanical_fear)
         if action is None and sig["reasons"]:
             action = ("full", _reason_code_from_signal_details(sig["signal_details"]), sig["reasons"], quantity)
 
