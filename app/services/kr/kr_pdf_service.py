@@ -290,7 +290,7 @@ def _quote_section(ctx: dict, styles) -> List:
     quote = ctx.get("quote") or {}
     rows_data = quote.get("rows") or []
     story = _section(
-        f"2. 매수 견적서 (집행 예정 {ctx.get('execution_time', '09:05')} KST)", styles
+        f"2. 매수 견적서 (집행 예정 {ctx.get('execution_time', '09:15')} KST)", styles
     )
 
     if not rows_data:

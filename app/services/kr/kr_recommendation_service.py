@@ -551,13 +551,19 @@ def get_scored_universe(extra_codes: Optional[List[str]] = None) -> dict:
 # ══════════════════════════════════════════════════════════════════
 
 def _technical_sell_signals(
-    tech: Optional[dict], sentiment: Optional[dict], fear_index: Optional[float]
+    tech: Optional[dict],
+    sentiment: Optional[dict],
+    fear_index: Optional[float],
+    change_pct: Optional[float] = None,
 ) -> dict:
     """
     기술적 매도 신호(데드크로스/RSI/MACD/패닉셀/수급이탈) + 공포장 조건 계산.
 
     get_mechanical_sell_candidates()(기계적 자동매도, 조건 2/3)와 get_llm_sell_context()
     (LLM 정성적 컨텍스트)가 동일한 계산을 공유한다 — 두 곳의 신호값이 어긋나지 않게 하기 위함.
+
+    change_pct 는 매입가 대비 등락률(%)로, 공포장 조건(조건 3)의 손실 게이트에만 쓴다.
+    주지 않으면(None) 손실 게이트 없이 종전대로 판정한다 — 모르면 보호 쪽으로 실패한다.
     """
     signal_count = 0
     signal_details: List[str] = []
@@ -635,16 +641,26 @@ def _technical_sell_signals(
     # 극단 40→60, 완화 30→40 으로 문턱을 올렸다 — 종전 문턱은 "불안한 정도"에도 신호 1개로
     # 전량매도가 나가버려, 같은 원본 신호를 보고 더 정교하게 판단하는 LLM 의 SELL_PARTIAL 같은
     # 선택지가 실행 기회조차 못 얻는 경우가 많았다. 진짜 극단적 국면에서만 기계적으로 개입한다.
-    if fear_index is not None and signal_count >= 1:
+    #
+    # 손실 게이트 — 조건 3 은 '손실 중인 포지션'에만 적용한다. 규칙의 취지는 패닉 국면에서
+    # 위험을 줄이는 것이지, 본전이거나 수익 중인 포지션을 국면만 보고 털어내는 게 아니다.
+    # (2026-08-24 HMM: 22,650원 매수 → 22,650원 매도, 손익 0원으로 청산됐다. 손절가
+    # 21,300원 근처에도 가지 않았고 조건 3 하나만으로 나간 주문이었다.)
+    # 문턱은 KR_FEAR_SELL_LOSS_PCT(기본 3.0 → -3.00% 이하)로 조정한다.
+    loss_gate_open = (
+        change_pct is None or change_pct <= -settings.KR_FEAR_SELL_LOSS_PCT
+    )
+    if fear_index is not None and signal_count >= 1 and loss_gate_open:
+        loss_note = f", 매입가 대비 {change_pct:+.2f}%" if change_pct is not None else ""
         if fear_index > 60:
             reasons.append(
                 f"극단적 공포(변동성 {fear_index:.1f}%) + 매도 신호 {signal_count}개: "
-                f"{', '.join(signal_details)}"
+                f"{', '.join(signal_details)}{loss_note}"
             )
         elif fear_index > 40 and signal_count >= 2:
             reasons.append(
                 f"공포 시장(변동성 {fear_index:.1f}%) + 매도 신호 {signal_count}개: "
-                f"{', '.join(signal_details)}"
+                f"{', '.join(signal_details)}{loss_note}"
             )
 
     return {
@@ -674,8 +690,8 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
               부분익절 미실행 + 익절가 도달 → 부분매도(KR_PARTIAL_SELL_RATIO), 잔량은 샹들리에로 전환
               (ATR/거래기록 없는 레거시 보유분은 고정비율 전량 익절/손절만)
       조건 2: 기술적 매도 신호 개수 (데드크로스/RSI>70/MACD매도/패닉셀/수급이탈, ADX 보정) → 전량매도
-      조건 3: 공포장(변동성>60+신호1개, >40+신호2개) → 전량매도
-              단 변동성 게이트가 수동 해제된 동안에는 조건 3 을 잠재운다 (아래 주석 참조)
+      조건 3: 공포장(변동성>60+신호1개, >40+신호2개) + 매입가 대비 손실 KR_FEAR_SELL_LOSS_PCT
+              이상 → 전량매도. 단 변동성 게이트가 수동 해제된 동안에는 잠재운다 (아래 주석 참조)
 
     반환:
       sell_candidates — 각 항목에 exit_type("full"/"partial"), reason_code 포함
@@ -868,7 +884,8 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
 
         # ── 조건 2/3 (조건 1 이 이미 발동했으면 건너뜀) ──────
         # mechanical_fear 는 오버라이드 활성 시 None — 조건 3 만 비활성화된다
-        sig = _technical_sell_signals(tech, sentiment, mechanical_fear)
+        # change_pct 는 조건 3 의 손실 게이트용 (KR_FEAR_SELL_LOSS_PCT)
+        sig = _technical_sell_signals(tech, sentiment, mechanical_fear, change_pct)
         if action is None and sig["reasons"]:
             action = ("full", _reason_code_from_signal_details(sig["signal_details"]), sig["reasons"], quantity)
 
@@ -1023,7 +1040,9 @@ def get_llm_sell_context(balance: Optional[dict] = None) -> dict:
         change_pct = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
         trade = trade_map.get(code)
         scored_entry = scored_map.get(code)
-        sig = _technical_sell_signals(tech_map.get(code), sentiment_map.get(code), fear_index)
+        sig = _technical_sell_signals(
+            tech_map.get(code), sentiment_map.get(code), fear_index, change_pct
+        )
 
         # 활성 손절/트레일링선까지 남은 여유, 1차 익절선까지 남은 폭 — LLM 이 "지금 내 판단이
         # 실제로 얼마나 중요한지"(기계적 안전망이 곧 작동할지 여부)를 가늠할 수 있게 한다.

@@ -170,6 +170,12 @@ class Settings(BaseSettings):
     # 보류한다(취소가 아니라 다음 사이클에 다시 검사). 0 이하로 두면 재검증을 끈다.
     KR_SELL_REVALIDATE_PCT: float = float(os.getenv("KR_SELL_REVALIDATE_PCT", "3.0"))
 
+    # 공포장 강제청산(매도 조건 3) 발동 최소 손실률(%). 양수로 적으며 "매입가 대비 이 %
+    # 이상 손실일 때만 발동"을 뜻한다(기본 3.0 → -3.00% 이하). 조건 3 의 취지는 패닉
+    # 국면에서 위험을 줄이는 것이지 본전/수익 포지션을 국면만 보고 털어내는 게 아니다.
+    # 0 으로 두면 손실이기만 하면(-0.01% 도) 발동하고, 음수로 두면 수익 구간까지 발동한다.
+    KR_FEAR_SELL_LOSS_PCT: float = float(os.getenv("KR_FEAR_SELL_LOSS_PCT", "3.0"))
+
     # 장중 추가 매도검토(조건부 주기체크): 공포지수가 이 값을 넘는 날은, 마지막 매도검토 이후
     # KR_INTRADAY_REVIEW_INTERVAL_HOURS 시간마다 LLM 매도검토를 한 번 더 돌린다. 공포지수는
     # 장 마감 후에만 갱신되므로 "장중에 막 넘어선 순간"은 관측 불가 — 그래서 이벤트 트리거가

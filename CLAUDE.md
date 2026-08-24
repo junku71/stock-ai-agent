@@ -109,7 +109,7 @@ Scheduling: schedule, APScheduler
 한국 증시는 15:30 에 닫혀 장 마감 후 주문이 불가하므로 **분석과 집행을 분리**한다.
 - **16:30 Phase A (분석)**: 시장데이터 → Kaggle ML → 기술지표+뉴스감성 → LLM 검토 → `kr_buy_queue` 저장
   → 분석 리포트 PDF 생성 후 Slack 채널 업로드 (6단계, 실패해도 파이프라인은 성공 처리)
-- **09:05 Phase B (집행)**: 큐를 읽어 현재가 재조회 후 지정가 매수
+- **09:15 Phase B (집행)**: 큐를 읽어 현재가 재조회 후 지정가 매수
 - **09:00~15:20 매도 감시**: 1분 주기 (동시호가 구간 제외)
 
 ### 주의
@@ -138,6 +138,7 @@ Scheduling: schedule, APScheduler
 `KR_CHANDELIER_ATR_MULT`(기본 3.0), `KR_PARTIAL_SELL_RATIO`(기본 0.3),
 `KR_MIN_PARTIAL_SHARES`(기본 1), `KR_ROTATION_MIN_SCORE_GAP`(기본 0.30),
 `KR_SCORE_TREND_DAYS`(기본 5), `KR_SELL_REVALIDATE_PCT`(기본 3.0),
+`KR_FEAR_SELL_LOSS_PCT`(기본 3.0 — 공포장 강제청산 발동 최소 손실률, 양수로 적는다),
 `KR_INTRADAY_FEAR_REVIEW_THRESHOLD`(기본 40.0), `KR_INTRADAY_REVIEW_INTERVAL_HOURS`(기본 2) —
 매도전략(부분익절+샹들리에 트레일링, 교체매매, LLM 판단 품질 보강, 장중 추가 매도검토) 관련. 자세한
 설명은 `documents/20_국내주식_KOSPI30_설계.md` 6장 참조
