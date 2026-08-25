@@ -372,15 +372,17 @@ def get_sentiment_map() -> Dict[str, dict]:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 동적 후보군용 (1단계 스크리닝)
+# 신규종목 추천 스크리닝용 (kr_screening_service)
 #   fetch_and_store_sentiment() 는 고정 유니버스(universe.CODE_TO_NAME)를 전제로 한다.
-#   1단계 스크리닝은 시총 상위 200 동적 후보군을 다루므로 고정 리스트 밖 종목이 절반쯤
-#   된다. 그래서 이름을 인자로 받아 같은 채점기를 재사용하는 진입점을 따로 둔다.
+#   스크리닝도 지금은 같은 고정 100종목을 쓰지만, 종목명을 인자로 직접 받는 게
+#   호출부(kr_screening_service) 입장에서 더 단순해 별도 진입점을 유지한다.
 #   결과를 DB 에 저장하지 않는 것도 의도적이다 — kr_ticker_sentiment_analysis 는
-#   ML/점수 파이프라인이 읽는 테이블이라 후보군이 다른 데이터를 섞으면 안 된다.
+#   ML/점수 파이프라인이 읽는 테이블이라 스크리닝 결과를 섞으면 안 된다.
 # ══════════════════════════════════════════════════════════════════
 
-def score_items(items: List[dict], with_blog: bool = True) -> Dict[str, dict]:
+def score_items(
+    items: List[dict], with_blog: bool = True, progress: bool = True
+) -> Dict[str, dict]:
     """
     임의의 종목 목록을 감성 채점한다. DB 에 쓰지 않는다.
 
@@ -397,7 +399,7 @@ def score_items(items: List[dict], with_blog: bool = True) -> Dict[str, dict]:
         return {}
 
     collected = []
-    for it in items:
+    for i, it in enumerate(items, 1):
         query = universe.news_query_for(it["code"], it.get("name"))
         try:
             articles = naver_service.search_recent_news(
@@ -418,12 +420,19 @@ def score_items(items: List[dict], with_blog: bool = True) -> Dict[str, dict]:
             {"code": it["code"], "name": it.get("name") or it["code"],
              "articles": articles, "blog_buzz": buzz}
         )
+        if progress and (i % 10 == 0 or i == len(items)):
+            logger.info(f"  감성 분석 뉴스 수집 {i}/{len(items)}")
         time.sleep(0.2)
 
     client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     scored: Dict[str, dict] = {}
+    batches = -(-len(collected) // TICKERS_PER_CALL)
     for i in range(0, len(collected), TICKERS_PER_CALL):
         batch = collected[i : i + TICKERS_PER_CALL]
+        if progress:
+            logger.info(
+                f"  감성 분석 LLM {i // TICKERS_PER_CALL + 1}/{batches} 배치 ({len(batch)}종목)"
+            )
         try:
             scored.update(_score_batch(client, batch))
         except Exception as e:
