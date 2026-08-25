@@ -1,5 +1,13 @@
 # Slack 연동 가이드
 
+> **적용 범위** — Incoming Webhook 연동 방식과 attachment 포맷은 지금도 유효하다. 다만 이
+> 문서의 `notification_service.py` 와 통합 지점(`app/utils/scheduler.py`)은 **미국 트랙의
+> 것으로 지금은 존재하지 않는다.** 현재 구조는 저수준 전송이
+> `app/services/slack_service.py` 의 `_send` 하나이고, 메시지 포맷은
+> `app/services/kr/kr_notification_service.py` 가 만든다. PDF 첨부는 Webhook 으로 불가능해
+> Bot Token 을 쓰는 `app/services/kr/slack_file_service.py` 가 따로 담당한다.
+
+
 > 자동매매 시스템의 핵심 이벤트 4가지를 Slack 채널로 알리는 통합 가이드.
 > Incoming Webhook + `notification_service.py` 한 파일 + 통합 포인트 4곳.
 

@@ -1,5 +1,11 @@
 # Kaggle API 연동 — 우리 시스템 ML 자동화 가이드
 
+> **적용 범위** — push/폴링 메커니즘과 트러블슈팅은 지금도 그대로 유효하다. 다만 이 문서가
+> 쓰인 시점의 대상은 미국 트랙 커널(`kaggle_notebook/predict.py`, `KAGGLE_KERNEL_SLUG`)이었고,
+> **현재 대상은 국내 커널**(`kaggle_notebook_kr/predict_kr.py`, `KAGGLE_KERNEL_SLUG_KR`)이다.
+> `ml_trigger_service` 의 기본값도 국내 커널로 바뀌었으니 경로만 바꿔 읽으면 된다.
+
+
 > 매일 수동으로 Colab에서 돌리던 `predict_colab.py` 를 Kaggle 무료 GPU + 우리 FastAPI 에서 자동 트리거하기 위한 통합 가이드.
 > 실제 적용 과정에서 부딪힌 6단계 트러블슈팅 모두 포함.
 

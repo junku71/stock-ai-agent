@@ -1,19 +1,37 @@
 # 국내주식(KOSPI 100) 자동매매 트랙 설계
 
-미국 주식 자동매매 시스템을 KOSPI 시가총액 상위 100개 종목에 적용한 트랙이다.
-기존 미국 트랙은 **그대로 유지**되고, 국내 트랙이 병행 운영된다.
+KOSPI 시가총액 상위 100개 종목을 대상으로 하는 자동매매 시스템의 설계 문서다.
+**이 시스템이 다루는 시장은 국내 하나뿐이다.**
+
+> 과거에는 미국 주식 트랙과 병행 운영됐다. 미국 트랙은 전부 삭제됐고, 관련 문서는
+> `documents/_archive_us/` 에 보존돼 있다 (현재 코드와 대조하면 안 된다).
 
 ---
 
-## 1. 미국 트랙과의 관계
+## 1. 모듈 구성
 
-| 구분 | 처리 |
-|------|------|
-| **공유** | `scoring_service`(z-score·사전필터), `notification_service._send`(Slack 전송), `balance_service.get_access_token`(KIS 토큰), `ml_trigger_service`(Kaggle), `db/supabase` |
-| **신규** | 데이터 수집, KIS 국내 주문, 뉴스 감성, 스케줄러, LLM 프롬프트, 전용 테이블(`kr_*`) |
-| **격리** | `schedule` 전역 큐를 쓰지 않고 **KR 전용 `schedule.Scheduler()` 인스턴스**를 사용한다. 두 스레드가 같은 큐에 `run_pending()`을 돌리면 잡이 중복 실행돼 이중 주문이 날 수 있다. |
+시장에 종속되지 않는 것만 `app/services/` 최상위에 두고, 국내 시장에 종속된 것은
+전부 `app/services/kr/` 아래로 모은다.
 
-`KR_ENABLED=false`면 국내 스케줄러는 기동하지 않는다. 미국 트랙에는 어떤 영향도 없다.
+| 위치 | 모듈 | 역할 |
+|------|------|------|
+| **공용** | `scoring_service` | 매수 후보 사전 필터 + cross-sectional z-score |
+| | `indicators` | SMA / EMA / RSI / MACD / ATR / ADX 수식 |
+| | `position_sizing` | 확신도 가중 포지션 배분 |
+| | `kis_auth_service` | KIS 토큰 발급·캐싱 (메모리 + Supabase, 1분 스로틀) |
+| | `slack_service` | Slack Webhook 저수준 전송 |
+| | `ml_trigger_service` | Kaggle 커널 push + 완료 폴링 |
+| | `buy_switch_service` | 신규 매수 원격 on/off (영속 스위치) |
+| **국내 전용** | `kr/` 패키지 전체 | 데이터 수집, KIS 국내 주문, 뉴스 감성, 점수, LLM 프롬프트, 리포트 |
+| | `app/utils/kr_scheduler.py` | 2단계 파이프라인 + 매도 감시 + 주문 정합성 |
+| | `kr_*` 테이블 | `sql/kr/setup_kr.sql` |
+
+**스케줄러 격리**: `schedule` 전역 큐를 쓰지 않고 전용 `schedule.Scheduler()` 인스턴스를
+쓴다. 다른 워커와 같은 큐를 공유하면 두 스레드가 `run_pending()` 을 동시에 돌려 잡이
+중복 실행되고 이중 주문이 날 수 있다.
+
+`KR_ENABLED=false` 면 API 서버만 뜨고 스케줄러는 기동하지 않는다 — 점검이나 수동 백필처럼
+자동매매가 돌면 곤란한 상황에서 쓰는 킬 스위치다.
 
 ---
 
@@ -38,14 +56,14 @@
 부가 활용:
 
 - **데이터랩 검색어 트렌드**(`POST /datalab/v1/search`) — 종목명 검색량 급증 = 개인 관심 유입.
-  미국판에 없던 신규 신호지만 **점수에는 넣지 않고** LLM 참고 정보로만 넘긴다.
+  **점수에는 넣지 않고** LLM 참고 정보로만 넘긴다.
   한국 시장에서 개인 관심 급증은 고점 신호로 작동하는 경우가 많아 부호가 불안정하기 때문이다.
 - 블로그 언급량 — 보조 신호.
 
 **Naver API Hub에 주가·재무지표 API는 없다.** 네이버 금융은 웹페이지일 뿐 공식 API가 아니며
 크롤링은 ToS 위반 소지가 있다.
 
-### 2-2. AlphaVantage / Finnhub 국내 대체재
+### 2-2. 데이터 소스 선택
 
 | 용도 | 소스 | 비고 |
 |------|------|------|
@@ -113,8 +131,8 @@ NAVER API Hub  -> 뉴스 원문 + 검색 트렌드
 
 ## 4. 시간 구조 — 왜 2단계인가
 
-미국 트랙은 KST 21:00 파이프라인이 곧 NY 장 시작 전이라 분석과 매수를 한 번에 끝낼 수 있다.
 한국 증시는 **15:30 KST에 닫히므로 장 마감 후 분석 시점에는 주문을 낼 수 없다.**
+그래서 분석을 장 마감 뒤에 돌려 큐에 쌓아두고, 집행은 다음 거래일 개장 직후로 미룬다.
 
 ```
 평일 09:00 ------------------ 15:20 -- 15:30      16:30 ------------------------- (다음 개장일) 09:15
@@ -139,7 +157,7 @@ NAVER API Hub  -> 뉴스 원문 + 검색 트렌드
 
 ## 5. 점수 체계 (`kr_scoring.py`)
 
-미국 트랙의 cross-sectional z-score 방식에 **수급 팩터**를 추가했다.
+공용 모듈(`scoring_service`)의 cross-sectional z-score 위에 **수급 팩터**를 얹었다.
 
 | 팩터 | 가중치 | 근거 |
 |------|--------|------|
@@ -150,7 +168,7 @@ NAVER API Hub  -> 뉴스 원문 + 검색 트렌드
 | ADX 추세 강도 | 0.15 | trend persistence |
 | 뉴스 감성 | 0.10 | 학술 IC 약함 |
 
-**사전 필터**(미국과 공유): RSI > 80 하드블록 + 기술 신호 2개 이상.
+**사전 필터**(`scoring_service.apply_prefilters`): RSI > 80 하드블록 + 기술 신호 2개 이상.
 
 **공포 게이트**: 한국에는 VIX에 대응하는 무료 실시간 지수를 붙이기 번거로워
 **코스피 일별 수익률의 20일 실현변동성(연율 %)** 을 쓴다.
@@ -229,30 +247,26 @@ GET  /kr/fear-gate                 # 현재 변동성/임계값/해제 여부
 
 ### 6-1. 기계적 규칙 (조건 1~3, 항상 실행)
 
-**조건 1 — ATR 손절 / 부분익절 + 샹들리에 트레일링**
+> **매도는 언제나 전량이다.** 어떤 조건으로 팔든 보유수량 전부를 판다. 부분매도, 트레일링
+> 잔량 보유, LLM 의 일부매도 판정은 모두 없다. 판단은 "팔 것인가 말 것인가" 하나뿐이다.
+
+**조건 1 — ATR 전량 익절 / 전량 손절**
 
 ```
 매수 시점 ATR 을 그대로 고정해서 쓴다 (장중 재계산하지 않는다)
-  손절선   = buy_price − 1.5×ATR                    (무조건, 즉시 전량매도)
-  1차 목표 = buy_price + 2.5×ATR 도달 시
-             → 보유량의 30%(KR_PARTIAL_SELL_RATIO)만 매도(부분익절)
-             → 잔량은 "샹들리에 트레일링 스탑"으로 넘어간다
+  손절선 = buy_price − 1.5×ATR  도달 시 → 전량 손절
+  익절선 = buy_price + 2.5×ATR  도달 시 → 전량 익절
 ```
 
-**샹들리에 트레일링이란?** — 등산할 때 쓰는 이동식 등산용 랜턴(chandelier)처럼, 정해진 목표가가
-아니라 **가격이 오를 때마다 손절선도 같이 따라 올라가는** 방식이다.
+손절선을 먼저 검사하고, 걸리지 않으면 익절선을 본다. 둘 중 하나라도 걸리면 그 종목은
+보유수량 전부가 그 사이클에 매도 주문으로 나간다.
 
-- 부분익절 이후 매일 "지금까지 도달한 최고가(peak)"를 갱신한다.
-- 손절선 = `peak − 3.0×ATR (KR_CHANDELIER_ATR_MULT)`. **peak 이 오르면 손절선도 오르지만, peak 이
-  아직 안 올랐다고 손절선이 내려가지는 않는다** (래칫 — 한쪽 방향으로만 조여진다).
-- 이 손절선을 밑으로 뚫으면 잔량 전량매도.
+**트레이드오프** — 익절선에서 전량을 털기 때문에, 그 뒤로 추세가 더 이어져도 그 상승은 못
+가져간다. 대신 판단과 상태가 단순해진다: 포지션은 "보유 중" 아니면 "청산"이고, 잔량·트레일링
+고점·누적 실현손익 같은 중간 상태를 추적할 필요가 없다.
 
-즉 고정 익절가에서 무조건 전량 매도하던 기존 방식과 달리, **원금 성격의 일부는 먼저 회수하고
-(부분익절), 나머지는 추세가 살아있는 한 계속 태우다가 추세가 꺾이는 순간(고점 대비 3×ATR 하락)
-청산**하는 구조다. 상승 추세를 조기에 끊는 문제를 완화한다.
-
-ATR/거래기록이 없는 보유분(예: 수동 매수, 이관된 옛 데이터)은 고정비율(+6% / −7%) 폴백을 그대로 쓴다
-— 부분익절·샹들리에는 적용되지 않는다.
+ATR/거래기록이 없는 보유분(예: 수동 매수, 이관된 옛 데이터)은 고정비율(+6% / −7%) 폴백을
+쓴다 — 이 역시 전량 익절/손절이다.
 
 **조건 2 — 기술적 매도 신호** (기존과 동일, 변경 없음)
 
@@ -264,7 +278,7 @@ ATR/거래기록이 없는 보유분(예: 수동 매수, 이관된 옛 데이터
 
 변동성 > 60 + 신호 1개(극단), 변동성 > 40 + 신호 2개(완화). *(기존 40/30 이었으나 상향 —
 LLM 매도검토가 조건 2/3 과 동일한 원본 신호를 근거로 더 정교하게 판단하는데, 문턱이 낮으면
-"불안한 정도"에도 신호 1개로 전량매도가 나가버려 LLM 의 SELL_PARTIAL 같은 더 정밀한 선택지가
+"불안한 정도"에도 신호 1개로 전량매도가 나가버려 LLM 의 더 정밀한 판단이
 실행 기회조차 못 얻는 문제가 있었다. 진짜 극단적 국면에서만 기계적으로 개입하도록 좁혔다.)*
 
 **손실 게이트 — 조건 3 은 손실 중인 포지션에만 발동한다** (`KR_FEAR_SELL_LOSS_PCT`, 기본 3.0
@@ -277,8 +291,8 @@ LLM 매도검토가 조건 2/3 과 동일한 원본 신호를 근거로 더 정�
 **변동성 게이트가 수동 해제된 동안에는 조건 3 을 잠재운다.** 공포장 강제청산과 매수 하드블록은
 같은 축의 규칙("공포 국면이니 기계적으로 개입한다")이라, 매수만 열고 매도를 그대로 두면 방금
 매수한 포지션이 신호 1개에 즉시 전량청산돼 왕복매매가 난다 (2026-08-24 HMM 이 매수 1분 만에
-손절가 근처에도 가지 않은 채 청산됐다). 억제되는 것은 조건 3 뿐이고 조건 1(ATR 손절/샹들리에/
-부분익절)과 조건 2(기술신호 개수)는 공포지수를 쓰지 않으므로 그대로 작동한다 — 하방 방어가
+손절가 근처에도 가지 않은 채 청산됐다). 억제되는 것은 조건 3 뿐이고 조건 1(ATR 전량 익절/손절)과
+조건 2(기술신호 개수)는 공포지수를 쓰지 않으므로 그대로 작동한다 — 하방 방어가
 사라지는 것이 아니다. LLM 매도검토(`get_llm_sell_context`)에는 실제 변동성이 그대로 전달된다.
 국면을 알고 판단하는 것과 판단 없이 청산되는 것은 다르기 때문이다.
 
@@ -299,7 +313,7 @@ LLM 매도검토가 조건 2/3 과 동일한 원본 신호를 근거로 더 정�
    보유 종목보다 `KR_ROTATION_MIN_SCORE_GAP`(0.30) 이상 높으면 "이 종목을 팔고 슬롯을 넘길
    가치가 있는지" 판단 재료로 제시한다.
 
-LLM 은 종목별로 `HOLD` / `SELL_ALL` / `SELL_PARTIAL` 을 결정하고 `kr_llm_sell_decision_logs` 에
+LLM 은 종목별로 `HOLD` / `SELL_ALL` 둘 중 하나를 결정하고 `kr_llm_sell_decision_logs` 에
 저장한다. 16:30 시점엔 장이 닫혀 있어 주문을 못 내므로, 실제 매도 주문은 **다음 매도 감시
 사이클**(다음 개장일 09:00~15:20)에 집행된다. 그 사이 기계적 규칙이 먼저 그 종목을 이미 팔았다면
 LLM 판정은 `skipped` 처리되고 중복 매도되지 않는다.
@@ -310,17 +324,17 @@ LLM 판정은 `skipped` 처리되고 중복 매도되지 않는다.
   종목별 점수/순위를 쌓아둔다. 이 이력 최근 `KR_SCORE_TREND_DAYS`(기본 5)일치를 프롬프트에
   그대로 보여줘서, "하루짜리 노이즈인지 추세적 악화인지 구분하라"는 지시를 LLM 이 실제로
   수행할 수 있는 데이터를 준다. 새 수집 없이 기존 로그 재활용이라 비용이 없다.
-- **누적 부분매도 이력 인지** — 프롬프트에 "이미 몇 % 를 정리했는지"를 명시한다. LLM 이
-  `partial_exit_done` 여부만 보고 또 SELL_PARTIAL 을 내리면 잔량에서 한 번 더 비중이
-  줄어드는(누적 축소) 구조라, 이미 충분히 줄었다면 HOLD 를 우선 고려하도록 안내한다.
+- **중간값이 없다는 점을 명시** — 프롬프트에서 "팔기로 하면 전량"임을 못박고, "조금 줄이고
+  싶다"는 애매한 상태는 SELL_ALL 이 아니라 HOLD 라고 안내한다. 선택지가 둘뿐일 때 애매한
+  판단이 전량청산으로 흘러가는 것을 막기 위한 장치다.
 - **집행 시점 재검증** (`price_at_decision`/`signal_count_at_decision` + `KR_SELL_REVALIDATE_PCT`,
   기본 3%) — 판단은 16:30 스냅샷 기준인데 집행은 최대 거의 하루 뒤다. 그 사이 (1) 가격이 판단
   시점보다 `KR_SELL_REVALIDATE_PCT` 이상 유리한 방향(상승)으로 이미 움직였거나, (2) 판단 근거였던
   기술신호 개수가 그새 줄었다면(근거 개선, `get_current_signal_count`로 가볍게 재확인), 판단이
   낡았다고 보고 이번 사이클 집행을 보류한다(취소 아님 — 매 사이클 다시 검사하고, 마감까지 계속
   그렇다면 다음날 새 판단으로 자연 대체된다).
-- **손절/익절 거리 제공** (`stop_distance_pct`/`take_profit_distance_pct`) — 활성 손절/트레일링선·
-  1차 익절선까지 남은 폭(%)을 보여줘서, LLM 이 "지금 내 판단이 실질적으로 얼마나 중요한지"(여유가
+- **손절/익절 거리 제공** (`stop_distance_pct`/`take_profit_distance_pct`) — 손절선·익절선까지
+  남은 폭(%)을 보여줘서, LLM 이 "지금 내 판단이 실질적으로 얼마나 중요한지"(여유가
   적으면 곧 기계적으로 정리될 테니 판단 부담이 낮고, 여유가 크면 판단이 더 중요함)를 가늠하게 한다.
 - **점수 추이의 보유기간 스코핑** — `get_score_trend()`는 매수일(`buy_date`) 이후 기록만 본다.
   같은 종목을 예전에 샀다 판 이력이 지금 보유분의 추세인 것처럼 섞이는 것을 막는다.
@@ -418,10 +432,21 @@ app/services/kr/
   kr_report_service.py         분석 리포트: 매수 견적서 산출 + LLM 서술 생성 + 전송 오케스트레이션
   kr_pdf_service.py            리포트 PDF 렌더러 (ReportLab, 한글 폰트 자동 탐색)
   slack_file_service.py        Slack 파일 업로드 (Bot Token 3단계 API — Webhook 은 첨부 불가)
+app/services/                  ── 시장 무관 공용 모듈 ──
+  scoring_service.py           사전 필터 + cross-sectional z-score
+  indicators.py                SMA/EMA/RSI/MACD/ATR/ADX 수식
+  position_sizing.py           확신도 가중 포지션 배분
+  kis_auth_service.py          KIS 토큰 발급/캐싱 (메모리 + Supabase, 1분 스로틀)
+  slack_service.py             Slack Webhook 저수준 전송
+  ml_trigger_service.py        Kaggle 커널 push + 완료 폴링
+  buy_switch_service.py        신규 매수 원격 on/off (영속 스위치)
 app/utils/kr_scheduler.py      2단계 파이프라인 + 매도 감시(기계적+LLM 판정 집행) + 정합성
 app/api/routes/kr.py           /kr/* 라우트
+app/api/routes/buy_switch.py   /buy-switch/* 라우트
 sql/kr/setup_kr.sql            전체 스키마 (테이블 10개 + 컬럼 마이그레이션 + RLS/권한, 멱등)
-kaggle_notebook_kr/            국내 전용 ML 커널 (predict_kr.py)
+sql/setup_market_switches.sql  매수 스위치 테이블
+kaggle_notebook_kr/            ML 커널 (predict_kr.py)
+scripts/buy_switch.{sh,ps1}    매수 스위치 CLI 래퍼
 ```
 
 ---
@@ -436,9 +461,9 @@ kaggle_notebook_kr/            국내 전용 ML 커널 (predict_kr.py)
 | `kr_ticker_sentiment_analysis` | 뉴스 감성 점수 |
 | `kr_news_articles` | 감성 점수 근거 기사 (사후 추적용) |
 | `kr_buy_queue` | 다음 개장일 매수 예약 |
-| `kr_trade_records` | 매매 기록 + ATR 익절/손절 + 부분익절·샹들리에 트레일링 상태(원화) |
+| `kr_trade_records` | 매매 기록 + ATR 전량 익절/손절선 (원화). 부분매도 관련 컬럼(`partial_exit_done`, `chandelier_*`, `realized_partial_*`)은 과거 기록 보존을 위해 스키마에 남아 있으나 더 이상 새로 쓰이지 않는다 |
 | `kr_llm_decision_logs` | LLM 매수검토 판단 로그 |
-| `kr_llm_sell_decision_logs` | LLM 매도검토 판단 로그 (HOLD/SELL_ALL/SELL_PARTIAL, 점수/순위/교체매매 근거 포함) |
+| `kr_llm_sell_decision_logs` | LLM 매도검토 판단 로그 (HOLD/SELL_ALL, 점수/순위/교체매매 근거 포함) |
 | `kr_fear_gate_overrides` | 변동성 게이트 수동 해제 이력 (감사) |
 
 ---
@@ -452,7 +477,8 @@ kaggle_notebook_kr/            국내 전용 ML 커널 (predict_kr.py)
 3. **Kaggle 커널 생성** — `kaggle_notebook_kr/kernel-metadata.json`의 `id`를 본인 계정으로.
    `ml_trigger_service`가 push 직전에 자동 교정도 한다
 4. **히스토리 백필** (수십 분): `POST /kr/market-data/collect?full=true`
-5. **드라이런 검증** — `KR_ENABLED=true`, `KR_DRY_RUN=true`로 두고 서버 재시작
+5. **드라이런 검증** — `KR_DRY_RUN=true`로 두고 서버 재시작
+   (`KR_ENABLED`는 기본이 `true`다. `false`로 두면 API만 뜨고 스케줄러는 멈춘다)
 
    ```
    GET  /kr/status                  설정/연동 상태 확인
@@ -460,7 +486,7 @@ kaggle_notebook_kr/            국내 전용 ML 커널 (predict_kr.py)
    POST /kr/technical/generate      기술 지표 생성
    POST /kr/sentiment/collect       뉴스 감성 수집
    GET  /kr/candidates/buy          매수 후보 확인
-   GET  /kr/candidates/sell         기계적 매도 후보 확인 (손절/부분익절/샹들리에/기술신호/공포장)
+   GET  /kr/candidates/sell         기계적 매도 후보 확인 (전량 익절/손절/기술신호/공포장)
    GET  /kr/candidates/scored-universe  점수 유니버스 확인 (임계값 컷 없음, 점수감쇠 디버깅용)
    GET  /kr/holdings/sell-review    LLM 매도검토 컨텍스트 확인 (LLM 호출 없이 입력만)
    POST /kr/pipeline/analysis       전체 분석 파이프라인 (Kaggle 포함, 매도검토 4단계 포함)
@@ -469,6 +495,7 @@ kaggle_notebook_kr/            국내 전용 ML 커널 (predict_kr.py)
    POST /kr/pipeline/execute-sell   매도 감시 즉시 실행 (기계적 규칙 + LLM 판정 집행)
    GET  /kr/report/config           리포트 설정 진단 (LLM 키 / Slack 업로드 준비 여부)
    POST /kr/report/send             직전 파이프라인 결과로 리포트 재생성 + 전송
+   GET  /buy-switch                 신규 매수 허용 여부 (외출 시 원격 차단용)
    ```
 
 6. **모의투자 전환** — `KR_DRY_RUN=false`, `KIS_USE_MOCK=true`

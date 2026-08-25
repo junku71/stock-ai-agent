@@ -1,7 +1,7 @@
 """
 국내 경제지표 + KOSPI100 주가 수집 → Supabase `kr_economic_and_stock_data`.
 
-미국 트랙(stock.py + economic_service.py)의 국내판이다. 역할 분담은 이렇게 나눴다.
+국내 시장 데이터 수집 파이프라인. 역할 분담은 이렇게 나눴다.
 
   Yahoo Finance  : KOSPI/KOSPI200/KOSDAQ 지수, 환율, 글로벌 지표, 30종목 일별 종가
                    → 2006년부터의 히스토리 백필이 필요해 무료·무제한 소스를 쓴다.
@@ -372,7 +372,7 @@ def _download_all(start: str, end: str) -> Optional[pd.DataFrame]:
     merged.index = pd.to_datetime(merged.index.date)
     merged = merged[~merged.index.duplicated(keep="last")]
 
-    # 휴장일/공표 주기 차이로 생기는 결측은 전진 채움 (미국 트랙과 동일 전략)
+    # 휴장일/공표 주기 차이로 생기는 결측은 전진 채움
     merged = merged.ffill()
     return merged
 
@@ -473,7 +473,7 @@ def collect_market_data(force_full: bool = False) -> dict:
         rows.append(row)
         previous = {k: v for k, v in row.items() if k != "날짜"}
 
-    # upsert (날짜 unique) — 미국 트랙의 행별 select+insert 대비 훨씬 빠르다
+    # upsert (날짜 unique) — 행별 select+insert 대비 훨씬 빠르다
     #
     # 변동성 컬럼은 나중에 추가된 것이라, 스키마 설치(sql/kr/setup_kr.sql)를
     # 아직 실행하지 않은 DB 에서는 PostgREST 가 "column not found"(PGRST204)로 거절한다.
@@ -529,7 +529,7 @@ def collect_market_data(force_full: bool = False) -> dict:
 
 def get_market_context() -> dict:
     """
-    최신 시장 환경. 미국 트랙의 'VIX 조회'에 해당하는 국내판이다.
+    최신 시장 환경 (공포지수 게이트·LLM 검토·리포트가 공유하는 진입점).
 
     한국에는 VIX 에 정확히 대응하는 무료 실시간 지수(VKOSPI)를 붙이기 번거로워,
     코스피 일별 수익률의 20일 실현변동성(연율%)을 공포 지표로 쓴다.

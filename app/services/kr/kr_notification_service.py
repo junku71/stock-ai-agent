@@ -1,8 +1,8 @@
 """
 국내주식 트랙 Slack 알림.
 
-전송 함수(_send)는 미국 트랙(app/services/notification_service.py)의 것을 그대로 쓰고,
-메시지 포맷만 원화·한국 시장 기준으로 다시 작성했다.
+저수준 전송(_send)은 공용 모듈(app/services/slack_service.py)이 담당하고,
+여기서는 원화·한국 시장 기준의 메시지 포맷만 만든다.
 SLACK_WEBHOOK_URL 이 비어 있으면 모든 함수가 조용히 no-op 이다.
 
 알림 종류:
@@ -11,11 +11,11 @@ SLACK_WEBHOOK_URL 이 비어 있으면 모든 함수가 조용히 no-op 이다.
   ③ notify_buy_queued       — 다음 영업일 매수 예약 목록 (장 마감 후 분석 결과)
   ④ notify_buy_ordered      — 매수 주문 접수
   ⑤ notify_buy_filled       — 매수 체결 (계좌 요약 + 보유 현황표)
-  ⑥ notify_sell_ordered     — 매도 주문 접수 (부분매도는 is_partial=True)
+  ⑥ notify_sell_ordered     — 매도 주문 접수 (매도는 언제나 전량)
   ⑦ notify_sell_filled      — 매도 체결 (손익 + 보유 현황표)
   ⑧ notify_pipeline_failure — 파이프라인 실패
   ⑨ notify_llm_failure      — LLM 검토 전체 실패 (Fail-Close 매수 차단)
-  ⑩ notify_llm_sell_decisions — 보유 종목 LLM 매도검토 결과(HOLD/SELL_ALL/SELL_PARTIAL)
+  ⑩ notify_llm_sell_decisions — 보유 종목 LLM 매도검토 결과(HOLD/SELL_ALL)
   ⑪ notify_llm_sell_failure   — LLM 매도검토 전체 실패 (Fail-Close 추가매도 보류, 기계적 규칙은 계속 작동)
 """
 import logging
@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 import pytz
 
 from app.core.config import settings
-from app.services.notification_service import _send  # 저수준 Webhook 전송 재사용
+from app.services.slack_service import _send  # 저수준 Webhook 전송
 
 logger = logging.getLogger(__name__)
 
@@ -357,15 +357,16 @@ def notify_buy_filled(
 # ══════════════════════════════════════════════════════════════════
 
 _SELL_REASON_KR = {
-    "take_profit": "익절 (ATR 목표가 도달)",
-    "partial_take_profit": "부분 익절 (ATR 목표가 도달 — 잔량은 트레일링 전환)",
-    "chandelier_stop": "샹들리에 트레일링 이탈 (부분익절 후 잔량 청산)",
-    "stop_loss": "손절 (ATR 손실 한도 도달)",
+    "take_profit": "전량 익절 (ATR 목표가 도달)",
+    "stop_loss": "전량 손절 (ATR 손실 한도 도달)",
     "signal": "기술 신호 매도",
     "panic_sell": "패닉셀 (급락 + 거래량 폭증)",
     "flow_out": "수급 이탈 (외국인·기관 순매도)",
     "llm_sell_all": "LLM 매도검토 (전량)",
-    "llm_partial_sell": "LLM 매도검토 (일부)",
+    # 부분매도를 폐지하기 전 기록에만 남아 있는 레거시 사유 — 과거 알림/리포트 표기용
+    "partial_take_profit": "부분 익절 (레거시)",
+    "chandelier_stop": "트레일링 이탈 (레거시)",
+    "llm_partial_sell": "LLM 매도검토 (일부, 레거시)",
 }
 
 
@@ -375,16 +376,10 @@ def notify_sell_ordered(
     qty: int,
     price: int,
     sell_reason: str,
-    is_partial: bool = False,
 ):
-    prefix = "[부분매도] " if is_partial else ""
-    tail = (
-        "\n_⏳ 체결 확인 후 잔량은 트레일링 스탑으로 계속 보유됩니다._"
-        if is_partial
-        else "\n_⏳ 체결은 정규장(09:00~15:30 KST) 매칭 후 별도 '체결' 알림으로 안내됩니다._"
-    )
+    tail = "\n_⏳ 체결은 정규장(09:00~15:30 KST) 매칭 후 별도 '체결' 알림으로 안내됩니다._"
     _send(
-        title=f"📋 {_mode_tag()} {prefix}매도 주문 접수: {stock_name} ({code})",
+        title=f"📋 {_mode_tag()} 전량매도 주문 접수: {stock_name} ({code})",
         message=(
             f"*수량:* {qty:,}주  *주문가(지정가):* {price:,}원  "
             f"*사유:* `{_SELL_REASON_KR.get(sell_reason, sell_reason)}`"
@@ -404,21 +399,17 @@ def notify_sell_filled(
     profit_loss_pct: float,
     buy_price: Optional[float] = None,
     buy_date: Optional[str] = None,
-    is_partial: bool = False,
 ):
     is_profit = profit_loss >= 0
     icon = "💰" if is_profit else "🩸"
     color = "#2eb886" if is_profit else "#ff9800"
     sign = "+" if is_profit else ""
-    prefix = "[부분매도] " if is_partial else ""
 
     parts = ["*이번 거래*", f"  {qty:,}주 @ {fill_price:,.0f}원"]
     if buy_price:
         parts.append(f"  매수가 {buy_price:,.0f}원 → 매도가 {fill_price:,.0f}원")
     parts.append(f"  손익: *{sign}{profit_loss:,.0f}원* ({sign}{profit_loss_pct:.2f}%)")
     parts.append(f"  사유: `{_SELL_REASON_KR.get(sell_reason, sell_reason)}`")
-    if is_partial:
-        parts.append("  _잔량은 트레일링 스탑으로 계속 보유됩니다._")
 
     if buy_date:
         try:
@@ -440,7 +431,7 @@ def notify_sell_filled(
 
     _send(
         title=(
-            f"{icon} {_mode_tag()} {prefix}매도 체결: {stock_name} ({code})  "
+            f"{icon} {_mode_tag()} 매도 체결: {stock_name} ({code})  "
             f"{sign}{profit_loss:,.0f}원 ({sign}{profit_loss_pct:.2f}%)"
         ),
         message="\n".join(parts),
@@ -507,7 +498,7 @@ def notify_llm_sell_failure(reason: str, held_count: int = 0):
         message=(
             f"Claude API 호출이 전부 실패했습니다 (Opus + Sonnet 폴백 포함).\n"
             f"Fail-Close 정책에 따라 *이번 사이클은 추가 매도를 진행하지 않습니다* (전 종목 HOLD).\n"
-            f"기계적 손절/부분익절/샹들리에 트레일링·기술신호개수·공포장 자동매도 규칙은 "
+            f"기계적 전량 익절/손절·기술신호개수·공포장 자동매도 규칙은 "
             f"이 실패와 무관하게 계속 정상 작동합니다.\n\n"
             f"검토 대상 보유종목: *{held_count}개*\n\n"
             f"*에러:*\n```{(reason or '')[:500]}```"

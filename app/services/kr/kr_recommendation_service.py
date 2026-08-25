@@ -1,14 +1,14 @@
 """
 국내주식 기술적 지표 생성 + 매수/매도 후보 산출.
 
-미국 트랙(app/services/stock_recommendation_service.py)과 같은 구조를 따르되,
-지표 계산 수식은 그대로 재사용한다 (SMA/EMA/RSI/MACD/ATR/ADX 는 시장 무관).
-KIS 국내 일봉의 필드명만 해외 일봉 형식으로 정규화해서 넘긴다.
+지표 계산 수식은 공용 모듈(app/services/indicators.py)을 그대로 쓴다
+(SMA/EMA/RSI/MACD/ATR/ADX 는 시장 무관). KIS 국내 일봉(stck_hgpr/stck_lwpr/
+stck_clpr)의 필드명만 _normalize_daily() 로 정규화해서 넘긴다.
 
 매수 후보 = ML 예측 ∩ 기술적 지표 ∩ 감성 ∩ 수급 → kr_scoring 으로 채점
 
 매도는 두 층으로 나뉜다:
-  기계적(get_mechanical_sell_candidates) = ATR 손절/부분익절+샹들리에 트레일링 ∪ 기술적 매도신호 ∪ 공포장 조건
+  기계적(get_mechanical_sell_candidates) = ATR 전량 익절/손절 ∪ 기술적 매도신호 ∪ 공포장 조건
   LLM 정성적(get_llm_sell_context + kr_llm_sell_review_service) = 점수감쇠 ∪ 교체매매 후보
 """
 import logging
@@ -20,11 +20,11 @@ import pytz
 
 from app.core.config import settings
 from app.db.supabase import supabase
-from app.services import market_switch_service
+from app.services import buy_switch_service
 from app.services.kr import kis_domestic_service as kis
 from app.services.kr import kr_market_data_service, kr_override_service, kr_scoring, universe
-# 지표 수식(SMA/EMA/RSI/MACD/ATR/ADX)은 시장 무관이라 미국 트랙 구현을 그대로 쓴다
-from app.services.stock_recommendation_service import StockRecommendationService
+# 지표 수식(SMA/EMA/RSI/MACD/ATR/ADX)은 시장 무관이라 공용 모듈을 그대로 쓴다
+from app.services.indicators import TechnicalIndicators
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ TABLE_TRADES = "kr_trade_records"
 
 LOOKBACK_DAYS = 180  # 기술적 지표 계산용 조회 기간
 
-# ATR 배수 — 미국 트랙과 동일 (익절 2.5×ATR, 손절 1.5×ATR)
+# ATR 배수 (익절 2.5×ATR, 손절 1.5×ATR)
 ATR_TAKE_PROFIT_MULT = 2.5
 ATR_STOP_LOSS_MULT = 1.5
 
@@ -46,7 +46,7 @@ ATR_STOP_LOSS_MULT = 1.5
 FALLBACK_TAKE_PROFIT_PCT = 6.0
 FALLBACK_STOP_LOSS_PCT = -7.0
 
-_indicators = StockRecommendationService()
+_indicators = TechnicalIndicators()
 
 
 def _normalize_daily(rows: List[dict]) -> List[dict]:
@@ -414,7 +414,7 @@ def get_buy_candidates() -> dict:
         ml = ml_map.get(code)
         if not ml:
             dropped["no_ml"] += 1
-            continue  # ML 예측이 없으면 후보에서 제외 (미국 트랙과 동일 정책)
+            continue  # ML 예측이 없으면 후보에서 제외
 
         try:
             rise_probability = float(ml.get("rise_probability") or 0)
@@ -638,9 +638,15 @@ def _technical_sell_signals(
             )
 
     # ── 공포장 ────────────────────────────────────────────
-    # 극단 40→60, 완화 30→40 으로 문턱을 올렸다 — 종전 문턱은 "불안한 정도"에도 신호 1개로
-    # 전량매도가 나가버려, 같은 원본 신호를 보고 더 정교하게 판단하는 LLM 의 SELL_PARTIAL 같은
-    # 선택지가 실행 기회조차 못 얻는 경우가 많았다. 진짜 극단적 국면에서만 기계적으로 개입한다.
+    # 공포장 판정은 매수 하드블록과 같은 기준(kr_scoring.FEAR_HARD_BLOCK, 90%)으로
+    # 통일한다 — 매수 쪽에서 "공포장"이라 부르는 국면과 매도 쪽 강제청산 국면이
+    # 서로 다른 변동성 문턱을 쓰면 운영자가 헷갈린다.
+    #
+    # 신호 조건은 "매도 신호 1개 이상 + 거래량 급증"이다. 진짜 패닉 국면에서는
+    # 거래량이 실리지 않은 채 신호만 뜬 경우(예: RSI 과매수 단독)까지 기계적으로
+    # 털어내면 과잉 반응이므로, 실제로 수급이 몰리고 있다는 증거(거래량 급증,
+    # KR_VOLUME_SURGE_RATIO 배 이상 — 매수 스크리닝의 '거래량 급증' 신호와 같은 기준)
+    # 를 함께 요구한다.
     #
     # 손실 게이트 — 조건 3 은 '손실 중인 포지션'에만 적용한다. 규칙의 취지는 패닉 국면에서
     # 위험을 줄이는 것이지, 본전이거나 수익 중인 포지션을 국면만 보고 털어내는 게 아니다.
@@ -650,18 +656,29 @@ def _technical_sell_signals(
     loss_gate_open = (
         change_pct is None or change_pct <= -settings.KR_FEAR_SELL_LOSS_PCT
     )
-    if fear_index is not None and signal_count >= 1 and loss_gate_open:
+    volume_ratio_value = None
+    if tech:
+        try:
+            volume_ratio_value = float(tech.get("volume_ratio"))
+        except (ValueError, TypeError):
+            volume_ratio_value = None
+    volume_surge = (
+        volume_ratio_value is not None
+        and volume_ratio_value >= settings.KR_VOLUME_SURGE_RATIO
+    )
+    if (
+        fear_index is not None
+        and fear_index > kr_scoring.FEAR_HARD_BLOCK
+        and signal_count >= 1
+        and volume_surge
+        and loss_gate_open
+    ):
         loss_note = f", 매입가 대비 {change_pct:+.2f}%" if change_pct is not None else ""
-        if fear_index > 60:
-            reasons.append(
-                f"극단적 공포(변동성 {fear_index:.1f}%) + 매도 신호 {signal_count}개: "
-                f"{', '.join(signal_details)}{loss_note}"
-            )
-        elif fear_index > 40 and signal_count >= 2:
-            reasons.append(
-                f"공포 시장(변동성 {fear_index:.1f}%) + 매도 신호 {signal_count}개: "
-                f"{', '.join(signal_details)}{loss_note}"
-            )
+        reasons.append(
+            f"공포장(변동성 {fear_index:.1f}% > {kr_scoring.FEAR_HARD_BLOCK:.0f}%) + "
+            f"매도 신호 {signal_count}개 + 거래량 급증({volume_ratio_value:.2f}배): "
+            f"{', '.join(signal_details)}{loss_note}"
+        )
 
     return {
         "reasons": reasons,
@@ -685,18 +702,20 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
     """
     보유 종목 중 매도 대상 식별 (기계적 규칙 — LLM 과 무관하게 항상 실행).
 
+    **매도는 언제나 전량이다.** 익절이면 전량 익절, 손절이면 전량 손절 — 부분매도나
+    트레일링 잔량 보유는 하지 않는다. 그래서 조건이 하나라도 걸리면 보유수량 전부를 판다.
+
     종목당 아래 순서로 한 가지만 발동한다 (조건 1 이 발동하면 조건 2/3 은 건너뜀):
-      조건 1: ATR 손절 / 샹들리에 트레일링 이탈(부분익절 후) → 전량매도
-              부분익절 미실행 + 익절가 도달 → 부분매도(KR_PARTIAL_SELL_RATIO), 잔량은 샹들리에로 전환
-              (ATR/거래기록 없는 레거시 보유분은 고정비율 전량 익절/손절만)
+      조건 1: ATR 손절가 이하 → 전량 손절 / ATR 익절가 이상 → 전량 익절
+              (ATR/거래기록 없는 레거시 보유분은 고정비율 전량 익절/손절)
       조건 2: 기술적 매도 신호 개수 (데드크로스/RSI>70/MACD매도/패닉셀/수급이탈, ADX 보정) → 전량매도
-      조건 3: 공포장(변동성>60+신호1개, >40+신호2개) + 매입가 대비 손실 KR_FEAR_SELL_LOSS_PCT
-              이상 → 전량매도. 단 변동성 게이트가 수동 해제된 동안에는 잠재운다 (아래 주석 참조)
+      조건 3: 공포장(변동성 > FEAR_HARD_BLOCK, 매수 하드블록과 동일 90%) + 매도 신호 1개
+              이상 + 거래량 급증(KR_VOLUME_SURGE_RATIO 배 이상) + 매입가 대비 손실
+              KR_FEAR_SELL_LOSS_PCT 이상 → 전량매도. 단 변동성 게이트가 수동 해제된
+              동안에는 잠재운다 (아래 주석 참조)
 
     반환:
-      sell_candidates — 각 항목에 exit_type("full"/"partial"), reason_code 포함
-      trailing_updates — 부분익절 완료 후 보유 중인 종목의 최신 peak/stop (매도 여부와 무관하게
-                          매 사이클 갱신 필요. 이 함수는 읽기 전용이라 DB 반영은 호출부가 한다)
+      sell_candidates — 각 항목에 quantity(=보유 전량), reason_code 포함
     """
     if balance is None:
         balance = kis.get_balance()
@@ -705,12 +724,11 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
         return {
             "message": f"잔고 조회 실패: {balance.get('msg1', '')}",
             "sell_candidates": [],
-            "trailing_updates": [],
         }
 
     holdings = balance.get("output1", [])
     if not holdings:
-        return {"message": "보유 종목이 없습니다", "sell_candidates": [], "trailing_updates": []}
+        return {"message": "보유 종목이 없습니다", "sell_candidates": []}
 
     tech_map: Dict[str, dict] = {}
     try:
@@ -765,7 +783,6 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
         logger.warning(f"kr_trade_records 조회 실패 (고정비율 폴백): {e}")
 
     sell_candidates = []
-    trailing_updates = []
 
     for item in holdings:
         code = item.get("pdno", "")
@@ -792,94 +809,42 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
             except (ValueError, TypeError):
                 atr = None
 
-        action = None  # (exit_type, reason_code, reasons, sell_qty)
+        action = None  # (reason_code, reasons)
 
+        # ATR 로 산출한 익절/손절선이 있으면 그것을, 없으면 고정비율 폴백.
+        # 어느 쪽이든 발동하면 **전량** 매도한다 (부분매도 없음).
+        # (atr 자체는 매수 시점에 tp/sl 을 만든 값이라 여기서 유효성 판단에만 쓴다)
         if trade and trade.get("take_profit_price") and trade.get("stop_loss_price") and atr:
             tp = float(trade["take_profit_price"])
             sl = float(trade["stop_loss_price"])
-            partial_done = bool(trade.get("partial_exit_done"))
 
-            if partial_done:
-                # 샹들리에 트레일링 — 진입시점 ATR 고정, 고점 대비 배수. 래칫(상향만).
-                stored_peak = trade.get("chandelier_peak_price")
-                peak = max(
-                    float(stored_peak) if stored_peak is not None else current_price,
-                    current_price,
-                )
-                candidate_stop = peak - settings.KR_CHANDELIER_ATR_MULT * atr
-                stored_stop = trade.get("chandelier_stop_price")
-                stop = max(
-                    float(stored_stop) if stored_stop is not None else float("-inf"),
-                    candidate_stop,
-                    sl,  # 손절선 아래로는 내려가지 않는다
-                )
-                trailing_updates.append(
-                    {
-                        "trade_id": trade.get("id"),
-                        "code": code,
-                        "peak_price": peak,
-                        "stop_price": stop,
-                    }
-                )
-                if current_price <= stop:
-                    action = (
-                        "full",
-                        "chandelier_stop",
-                        [
-                            f"샹들리에 트레일링 이탈: 현재가 {current_price:,.0f}원 <= "
-                            f"트레일링 스탑 {stop:,.0f}원 (고점 {peak:,.0f}원 대비 "
-                            f"{settings.KR_CHANDELIER_ATR_MULT:.1f}×ATR, 매입가 대비 {change_pct:+.2f}%)"
-                        ],
-                        quantity,
-                    )
-            elif current_price <= sl:
+            if current_price <= sl:
                 action = (
-                    "full",
                     "stop_loss",
                     [
-                        f"ATR 손절: 현재가 {current_price:,.0f}원 <= 손절가 {sl:,.0f}원 "
+                        f"ATR 손절(전량): 현재가 {current_price:,.0f}원 <= 손절가 {sl:,.0f}원 "
                         f"(매입가 대비 {change_pct:+.2f}%)"
                     ],
-                    quantity,
                 )
             elif current_price >= tp:
-                partial_qty = int(quantity * settings.KR_PARTIAL_SELL_RATIO)
-                if partial_qty < settings.KR_MIN_PARTIAL_SHARES or quantity - partial_qty < 1:
-                    action = (
-                        "full",
-                        "take_profit",
-                        [
-                            f"ATR 익절(전량 — 부분매도 수량 미달): 현재가 {current_price:,.0f}원 >= "
-                            f"익절가 {tp:,.0f}원 (매입가 대비 {change_pct:+.2f}%)"
-                        ],
-                        quantity,
-                    )
-                else:
-                    action = (
-                        "partial",
-                        "partial_take_profit",
-                        [
-                            f"ATR 부분익절({settings.KR_PARTIAL_SELL_RATIO:.0%}): 현재가 "
-                            f"{current_price:,.0f}원 >= 익절가 {tp:,.0f}원 (매입가 대비 "
-                            f"{change_pct:+.2f}%) — 잔량은 샹들리에 트레일링으로 전환"
-                        ],
-                        partial_qty,
-                    )
+                action = (
+                    "take_profit",
+                    [
+                        f"ATR 익절(전량): 현재가 {current_price:,.0f}원 >= 익절가 {tp:,.0f}원 "
+                        f"(매입가 대비 {change_pct:+.2f}%)"
+                    ],
+                )
         else:
-            # 레거시(ATR/거래기록 없음) — 고정비율 전량 익절/손절만
+            # 레거시(ATR/거래기록 없음) — 고정비율 전량 익절/손절
             if change_pct >= FALLBACK_TAKE_PROFIT_PCT:
                 action = (
-                    "full",
                     "take_profit",
-                    [f"익절(고정비율): 매입가 대비 {change_pct:+.2f}%"],
-                    quantity,
+                    [f"익절(고정비율, 전량): 매입가 대비 {change_pct:+.2f}%"],
                 )
             elif change_pct <= FALLBACK_STOP_LOSS_PCT:
                 action = (
-                    "full",
                     "stop_loss",
-                    [f"손절(고정비율): 매입가 대비 {change_pct:+.2f}%"],
-                    quantity,
+                    [f"손절(고정비율, 전량): 매입가 대비 {change_pct:+.2f}%"],
                 )
 
         # ── 조건 2/3 (조건 1 이 이미 발동했으면 건너뜀) ──────
@@ -887,21 +852,21 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
         # change_pct 는 조건 3 의 손실 게이트용 (KR_FEAR_SELL_LOSS_PCT)
         sig = _technical_sell_signals(tech, sentiment, mechanical_fear, change_pct)
         if action is None and sig["reasons"]:
-            action = ("full", _reason_code_from_signal_details(sig["signal_details"]), sig["reasons"], quantity)
+            action = (_reason_code_from_signal_details(sig["signal_details"]), sig["reasons"])
 
         if action is None:
             continue
 
-        exit_type, reason_code, reasons, sell_qty = action
+        reason_code, reasons = action
         sell_candidates.append(
             {
                 "code": code,
                 "stock_name": name,
-                "quantity": sell_qty,
-                "full_quantity": quantity,
-                "exit_type": exit_type,
+                "quantity": quantity,  # 항상 전량
                 "reason_code": reason_code,
                 "trade_id": trade.get("id") if trade else None,
+                # 과거(부분매도 시절)에 일부를 이미 실현한 보유분이 남아 있을 수 있다.
+                # 이번 전량매도 손익에 그 실현분을 더해야 이 거래의 총손익이 맞는다.
                 "realized_partial_pnl": float(trade.get("realized_partial_pnl") or 0) if trade else 0.0,
                 "realized_partial_qty": int(trade.get("realized_partial_qty") or 0) if trade else 0,
                 "buy_price": buy_price,
@@ -920,7 +885,6 @@ def get_mechanical_sell_candidates(balance: Optional[dict] = None) -> dict:
     return {
         "message": f"{len(sell_candidates)}개의 매도 대상을 식별했습니다",
         "sell_candidates": sell_candidates,
-        "trailing_updates": trailing_updates,
     }
 
 
@@ -1018,7 +982,7 @@ def get_llm_sell_context(balance: Optional[dict] = None) -> dict:
     # 보유종목을 파는 것 자체가 앞뒤가 안 맞는다 — 후보 산출(비용 드는 채점)까지 건너뛴다.
     best_waiting = None
     at_capacity = False
-    if market_switch_service.is_buy_enabled("KR"):
+    if buy_switch_service.is_buy_enabled():
         buy_result = get_buy_candidates()
         unheld_candidates = [c for c in buy_result.get("results", []) if c["code"] not in held_codes]
         best_waiting = unheld_candidates[0] if unheld_candidates else None
@@ -1049,14 +1013,11 @@ def get_llm_sell_context(balance: Optional[dict] = None) -> dict:
         stop_distance_pct = None
         take_profit_distance_pct = None
         if trade and current_price > 0:
-            active_stop = None
-            if trade.get("partial_exit_done") and trade.get("chandelier_stop_price"):
-                active_stop = trade.get("chandelier_stop_price")
-            elif trade.get("stop_loss_price"):
-                active_stop = trade.get("stop_loss_price")
-            if active_stop:
-                stop_distance_pct = round((current_price - float(active_stop)) / current_price * 100, 2)
-            if not trade.get("partial_exit_done") and trade.get("take_profit_price"):
+            if trade.get("stop_loss_price"):
+                stop_distance_pct = round(
+                    (current_price - float(trade["stop_loss_price"])) / current_price * 100, 2
+                )
+            if trade.get("take_profit_price"):
                 take_profit_distance_pct = round(
                     (float(trade["take_profit_price"]) - current_price) / current_price * 100, 2
                 )
@@ -1097,9 +1058,6 @@ def get_llm_sell_context(balance: Optional[dict] = None) -> dict:
                 "sentiment_score": sig["sentiment_score"],
                 "adx": sig["adx_value"],
                 "fear_index": fear_index,
-                "partial_exit_done": bool(trade.get("partial_exit_done")) if trade else False,
-                "realized_partial_qty": int((trade or {}).get("realized_partial_qty") or 0),
-                "chandelier_stop_price": (trade or {}).get("chandelier_stop_price"),
                 "atr": (trade or {}).get("atr"),
                 "take_profit_price": (trade or {}).get("take_profit_price"),
                 "stop_loss_price": (trade or {}).get("stop_loss_price"),

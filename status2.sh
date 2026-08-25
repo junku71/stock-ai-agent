@@ -49,7 +49,7 @@ if [ -n "\$ERRS" ]; then echo "\$ERRS" | sed 's/^.*: /  /'; else echo "  ✅ 에
 echo ""
 echo "[7] 최근 매매/파이프라인 활동"
 ACT=\$(journalctl -u $SERVICE --no-pager | grep -E "자동 매수|자동 매도|매수 주문|매도 주문|LLM 검토|Daily Pipeline|파이프라인 전체|매수 후보" | tail -5)
-if [ -n "\$ACT" ]; then echo "\$ACT" | sed 's/^.*: /  /'; else echo "  (아직 없음 — 21:00 KST 파이프라인 / 미국 장중 매도 시 생성)"; fi
+if [ -n "\$ACT" ]; then echo "\$ACT" | sed 's/^.*: /  /'; else echo "  (아직 없음 — 16:30 KST 분석 / 09:15 매수 집행 / 장중 매도 시 생성)"; fi
 
 echo ""
 echo "[8] 최근 로그 5줄"

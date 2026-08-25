@@ -1,8 +1,7 @@
 """
 국내주식(KOSPI 100) 주가 예측 모델 (Transformer) — Kaggle 실행용.
 
-미국판 kaggle_notebook/predict.py 의 국내 버전.
-구조(2-input Transformer, LOOKBACK 90 / FORECAST_HORIZON 14)는 동일하고 다음만 다르다:
+2-input Transformer (LOOKBACK 90 / FORECAST_HORIZON 14) 구조:
 
   - 입력 테이블 : kr_economic_and_stock_data
   - 타깃        : KOSPI 100 종목 (원 단위)

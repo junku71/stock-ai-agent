@@ -178,6 +178,28 @@ def news_query(code: str) -> str:
     return name
 
 
+def news_query_for(code: str, name: Optional[str] = None) -> str:
+    """
+    news_query() 의 동적 유니버스판 — 고정 유니버스에 없는 종목도 처리한다.
+
+    동적 후보군(kr_universe_service)은 200종목이라 고정 리스트(100종목) 밖 종목이 절반쯤
+    된다. 그 종목들은 CODE_TO_NAME 에 없으므로 이름을 인자로 받아 같은 규칙을 적용한다.
+    """
+    if code in NEWS_QUERY_OVERRIDE:
+        return NEWS_QUERY_OVERRIDE[code]
+    resolved = name or CODE_TO_NAME.get(code)
+    if not resolved:
+        return code
+    if len(resolved) <= _SHORT_NAME_LEN:
+        return f"{resolved} 주가"
+    return resolved
+
+
+def sector(code: str) -> Optional[str]:
+    """종목코드 → 업종. 고정 유니버스 밖이면 None."""
+    return CODE_TO_SECTOR.get(code)
+
+
 def resolve(code_or_name: str) -> Optional[str]:
     """종목코드 또는 종목명을 받아 종목코드로 정규화. 유니버스 밖이면 None."""
     if code_or_name in CODE_TO_NAME:

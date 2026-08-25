@@ -13,7 +13,7 @@ Kaggle API로 ML 예측 노트북을 트리거하는 서비스.
 
 Secrets 주입:
   - Kaggle UserSecretsClient 는 API push 로 만들어진 kernel 버전에서 작동하지 않음
-  - push 직전에 predict.py 를 .ipynb 로 변환하면서 .env 의 SUPABASE_URL/KEY 를
+  - push 직전에 predict_kr.py 를 .ipynb 로 변환하면서 .env 의 SUPABASE_URL/KEY 를
     첫 셀 os.environ 으로 박아서 보냄 → 매번 fresh 한 값으로 전송
   - 결과 .ipynb 는 .gitignore 처리 (secrets 가 들어가있어서 git 절대 커밋 금지)
 """
@@ -42,20 +42,19 @@ TERMINAL_ERR = {"error", "cancel_acknowledged", "cancel_requested"}
 def _kernel_ref(kernel_slug: Optional[str] = None) -> str:
     """`username/slug` 형태의 kernel reference 반환 (Kaggle 실제 username 기준)
 
-    kernel_slug 를 주면 그 커널을, 생략하면 .env 의 KAGGLE_KERNEL_SLUG(미국 트랙)를 쓴다.
-    국내 트랙은 별도 커널(KAGGLE_KERNEL_SLUG_KR)을 쓰므로 이 인자를 넘긴다.
+    kernel_slug 를 주면 그 커널을, 생략하면 .env 의 KAGGLE_KERNEL_SLUG_KR 을 쓴다.
     """
     if not settings.KAGGLE_USERNAME:
         raise RuntimeError(
             "KAGGLE_USERNAME 이 .env 에 설정되지 않았습니다 "
             "(토큰 이름이 아닌 실제 Kaggle 계정 username 사용)"
         )
-    return f"{settings.KAGGLE_USERNAME}/{kernel_slug or settings.KAGGLE_KERNEL_SLUG}"
+    return f"{settings.KAGGLE_USERNAME}/{kernel_slug or settings.KAGGLE_KERNEL_SLUG_KR}"
 
 
 def _notebook_dir(notebook_dir: Optional[str] = None) -> Path:
-    """노트북 폴더 절대경로 (생략 시 .env 의 KAGGLE_NOTEBOOK_DIR)"""
-    p = Path(notebook_dir or settings.KAGGLE_NOTEBOOK_DIR)
+    """노트북 폴더 절대경로 (생략 시 .env 의 KAGGLE_NOTEBOOK_DIR_KR)"""
+    p = Path(notebook_dir or settings.KAGGLE_NOTEBOOK_DIR_KR)
     if not p.is_absolute():
         # 프로젝트 루트(이 파일의 부모의 부모의 부모) 기준 상대경로 해석
         project_root = Path(__file__).resolve().parents[2]
@@ -73,7 +72,7 @@ def _kaggle_env() -> dict:
     """
     env = os.environ.copy()
 
-    # Windows 콘솔 cp949 인코딩 충돌 방지 (predict.py 의 한글 변수명 등)
+    # Windows 콘솔 cp949 인코딩 충돌 방지 (predict_kr.py 의 한글 변수명 등)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
 
@@ -153,7 +152,7 @@ def check_auth() -> Tuple[bool, str]:
 
 def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
     """
-    predict.py 를 읽어서 secrets 주입 셀을 prepend 한 .ipynb 로 변환.
+    predict_kr.py 를 읽어서 secrets 주입 셀을 prepend 한 .ipynb 로 변환.
 
     Kaggle UserSecretsClient 가 API push 로 만든 kernel 버전에서
     "Connection error trying to communicate with service" 로 실패하는
@@ -169,15 +168,15 @@ def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
     if not settings.SUPABASE_URL or not supa_key:
         raise RuntimeError(
             "SUPABASE_URL / SUPABASE_(SERVICE_ROLE_)KEY 가 .env 에 없습니다. "
-            "predict.ipynb 에 주입할 값이 없어 push 불가."
+            "predict_kr.ipynb 에 주입할 값이 없어 push 불가."
         )
 
     with open(py_path, "r", encoding="utf-8") as f:
         code = f.read()
 
-    # 첫 셀: secrets 를 os.environ 에 주입 (predict.py 가 os.environ.get 으로 읽음)
+    # 첫 셀: secrets 를 os.environ 에 주입 (predict_kr.py 가 os.environ.get 으로 읽음)
     #   SUPABASE_SERVICE_ROLE_KEY + SUPABASE_KEY 둘 다 service_role 값으로 주입한다.
-    #   (predict.py 가 둘 중 어느 이름으로 읽어도 동작 → 호환/안전)
+    #   (predict_kr.py 가 둘 중 어느 이름으로 읽어도 동작 → 호환/안전)
     secret_cell = {
         "cell_type": "code",
         "execution_count": None,
@@ -192,7 +191,7 @@ def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
         ],
     }
 
-    # 두 번째 셀: 원본 predict.py 코드 그대로
+    # 두 번째 셀: 원본 predict_kr.py 코드 그대로
     main_cell = {
         "cell_type": "code",
         "execution_count": None,
@@ -217,7 +216,7 @@ def _build_ipynb_with_injected_secrets(py_path: Path, ipynb_path: Path) -> None:
 
 def _sync_metadata_id(meta_path: Path, kernel_slug: Optional[str] = None) -> Optional[str]:
     """
-    kernel-metadata.json 의 "id" 를 .env 기준(`KAGGLE_USERNAME/KAGGLE_KERNEL_SLUG`)으로 맞춘다.
+    kernel-metadata.json 의 "id" 를 .env 기준(`KAGGLE_USERNAME/KAGGLE_KERNEL_SLUG_KR`)으로 맞춘다.
 
     저장소에 커밋된 id 는 다른 계정(예: 강사 계정)으로 박혀있을 수 있는데,
     그대로 push 하면 남의 kernel 을 건드리려다 권한 거부로 실패한다.
@@ -242,15 +241,15 @@ def _sync_metadata_id(meta_path: Path, kernel_slug: Optional[str] = None) -> Opt
 def push_kernel(
     kernel_slug: Optional[str] = None,
     notebook_dir: Optional[str] = None,
-    script_name: str = "predict.py",
+    script_name: str = "predict_kr.py",
 ) -> Tuple[bool, str]:
     """
     노트북 push (= 새 버전 + 실행 트리거).
     push 직전에 {script_name} + .env secrets 로 동명의 .ipynb 를 새로 생성.
 
     Args:
-        kernel_slug:  대상 커널 slug (생략 시 미국 트랙 KAGGLE_KERNEL_SLUG)
-        notebook_dir: 노트북 폴더 (생략 시 KAGGLE_NOTEBOOK_DIR)
+        kernel_slug:  대상 커널 slug (생략 시 KAGGLE_KERNEL_SLUG_KR)
+        notebook_dir: 노트북 폴더 (생략 시 KAGGLE_NOTEBOOK_DIR_KR)
         script_name:  변환할 파이썬 스크립트 파일명
 
     Returns: (success, message)
@@ -332,13 +331,13 @@ def trigger_and_wait(
     max_wait: int = MAX_WAIT_SEC,
     kernel_slug: Optional[str] = None,
     notebook_dir: Optional[str] = None,
-    script_name: str = "predict.py",
+    script_name: str = "predict_kr.py",
 ) -> Tuple[bool, str, dict]:
     """
     push로 트리거 → 완료될 때까지 폴링.
 
-    kernel_slug / notebook_dir / script_name 을 생략하면 미국 트랙 커널을 쓴다.
-    국내 트랙은 KAGGLE_KERNEL_SLUG_KR / KAGGLE_NOTEBOOK_DIR_KR / predict_kr.py 를 넘긴다.
+    kernel_slug / notebook_dir / script_name 을 생략하면 .env 의
+    KAGGLE_KERNEL_SLUG_KR / KAGGLE_NOTEBOOK_DIR_KR / predict_kr.py 를 쓴다.
 
     Returns:
         (success: bool, message: str, meta: dict)

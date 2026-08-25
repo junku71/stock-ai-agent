@@ -46,3 +46,7 @@ predict_colab.py
 
 # 국내 분석 리포트 PDF (KR_REPORT_DIR)
 reports/
+cache/
+logs/
+# 1단계 퀀트 스크리닝 원본(KR_QUANT_DATA_DIR) — 매주 갱신되는 다운로드 파일, 커밋 대상 아님
+data/

@@ -29,7 +29,7 @@ from app.core.config import settings
 from app.services.kr import kis_domestic_service as kis
 from app.services.kr import slack_file_service, universe
 from app.services.kr import kr_pdf_service
-from app.services.notification_service import _send
+from app.services.slack_service import _send
 from app.services.position_sizing import compute_weighted_slots
 
 logger = logging.getLogger(__name__)
@@ -277,7 +277,7 @@ def _build_prompt(ctx: dict) -> str:
 - 계좌 모드: {ctx.get('mode')}
 - 종목당 기준 비중 {settings.KR_SLOT_RATIO:.0%} (배분 {settings.KR_SLOT_METHOD}, tilt {settings.KR_SLOT_TILT}), 최대 보유 {settings.KR_MAX_POSITIONS}종목
 - 총 노출 상한 {settings.KR_MAX_TOTAL_EXPOSURE:.0%}, 종목당 {settings.KR_MIN_SLOT_RATIO:.0%}~{settings.KR_MAX_SLOT_RATIO:.0%}
-- 매도 규칙: ATR 손절 / 2.5×ATR 도달 시 {settings.KR_PARTIAL_SELL_RATIO:.0%} 부분익절 후 잔량은 {settings.KR_CHANDELIER_ATR_MULT}×ATR 샹들리에 트레일링
+- 매도 규칙: 2.5×ATR 도달 시 전량 익절 / 1.5×ATR 도달 시 전량 손절 (부분매도 없음)
 - 매수 집행 예정 시각: 다음 영업일 {settings.KR_EXECUTION_TIME} KST (지정가, 집행 시점 현재가 재계산)
 - 총자산 {_r(quote.get('total_assets'), 0)}원 / D+2 예수금 {_r(quote.get('cash'), 0)}원
 
@@ -454,6 +454,46 @@ def _slack_comment(ctx: dict) -> str:
     return "\n".join(lines)
 
 
+def _pending_buy_queue_as_candidates() -> List[dict]:
+    """
+    kr_buy_queue 의 pending 행을 build_buy_quote() 가 기대하는 후보 형태로 변환.
+
+    build_and_send_report() 가 원자료(artifacts) 없이 단독 호출됐을 때(메뉴 '분석
+    리포트 전송')를 위한 보정이다. 원래 이 함수는 스케줄러가 방금 만든 결과만 그리도록
+    설계돼 있어서, 메뉴에서 단독으로 부르면 실제로는 대기열에 종목이 있어도 리포트엔
+    0종목으로 나온다 — kr_screening_service(신규 종목 추천, 메뉴 4~7)로 승인한 매수는
+    이 프로세스의 스케줄러 인스턴스(kr_scheduler._artifacts)를 전혀 거치지 않고 바로
+    kr_buy_queue 에 적재되기 때문이다. DB 의 pending 상태가 곧 "지금 큐에 있는 것"의
+    유일한 진실이므로, 여기서 직접 읽어 채운다.
+    """
+    from app.db.supabase import supabase
+
+    try:
+        resp = (
+            supabase.table("kr_buy_queue")
+            .select("*")
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception as e:
+        logger.warning(f"  대기 중인 매수 큐 조회 실패(빈 목록으로 진행): {e}")
+        return []
+
+    rows = resp.data or []
+    return [
+        {
+            "code": r.get("code"),
+            "stock_name": r.get("stock_name") or universe.CODE_TO_NAME.get(r.get("code"), r.get("code")),
+            "sector": universe.CODE_TO_SECTOR.get(r.get("code"), ""),
+            "composite_score": r.get("composite_score"),
+            "rise_probability": r.get("rise_probability"),
+            "llm_reason": r.get("llm_reason"),
+        }
+        for r in rows
+    ]
+
+
 def build_and_send_report(artifacts: Optional[dict] = None) -> dict:
     """
     분석 파이프라인 결과 → 리포트 PDF → Slack 업로드.
@@ -462,16 +502,27 @@ def build_and_send_report(artifacts: Optional[dict] = None) -> dict:
         artifacts: 파이프라인이 수집한 원자료.
                    {market, all_candidates, approved, held, llm_reasoning,
                     sell_decisions, sell_market_analysis, steps}
-                   None 이면 빈 리포트가 만들어지므로 스케줄러가 항상 채워서 넘긴다.
-
-    Returns:
-        {"success": bool, "pdf_path": str|None, "uploaded": bool, "error": str|None}
+                   None 이면(= 메뉴에서 단독 호출) 원자료 대신 kr_buy_queue 의 pending
+                   상태를 읽어 approved 를 채운다 — all_candidates/llm_reasoning/
+                   sell_decisions 처럼 LLM 판정 사유 자체는 DB 로 복원할 수 없어 비운다.
     """
     if not settings.KR_REPORT_ENABLED:
         logger.info("KR_REPORT_ENABLED=false — 분석 리포트 생성 스킵")
         return {"success": True, "skipped": "disabled", "pdf_path": None, "uploaded": False}
 
+    standalone = artifacts is None
     artifacts = artifacts or {}
+    if standalone:
+        try:
+            artifacts["approved"] = _pending_buy_queue_as_candidates()
+        except Exception as e:
+            logger.warning(f"  단독 실행 — 매수 큐 보정 실패(0종목으로 진행): {e}")
+        artifacts.setdefault(
+            "llm_reasoning",
+            "이 리포트는 파이프라인을 새로 돌린 게 아니라 현재 kr_buy_queue 의 "
+            "대기(pending) 항목을 그대로 보여줍니다 — 판정 사유는 최초 분석 시점의 "
+            "것으로 복원되지 않습니다.",
+        )
     now = datetime.now(KST)
 
     # 매수 스위치 OFF 등으로 후보 산출 자체를 건너뛴 회차는 시장환경이 비어 있다.

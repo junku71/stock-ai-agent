@@ -1,8 +1,8 @@
 """
 국내주식 뉴스 감성 분석.
 
-미국 트랙은 AlphaVantage NEWS_SENTIMENT 가 종목별 감성 점수를 완제품으로 줬지만,
-네이버 검색 API 는 기사 제목/요약 텍스트만 준다. 그래서 여기서 직접 점수화한다.
+네이버 검색 API 는 감성 점수를 주지 않고 기사 제목/요약 텍스트만 준다.
+그래서 점수화를 여기서 직접 한다.
 
 흐름:
   1. 종목별 최근 N일 뉴스 수집 (naver_service)
@@ -182,8 +182,17 @@ def _score_batch(client: anthropic.Anthropic, batch: List[dict]) -> Dict[str, di
 
                 scored: Dict[str, dict] = {}
                 for row in data.get("results", []):
-                    code = str(row.get("code", "")).zfill(6)
-                    if code not in codes_in_batch:
+                    raw_code = str(row.get("code", "")).strip()
+                    # 종목코드는 앞자리 0 이 잘려 오는 경우가 있고("5930"), 섹터는
+                    # "SEC:" 접두사를 모델이 종종 떼고 돌려준다("SEC:화장품" → "화장품").
+                    # 둘 다 원본 매칭 실패 시 정규화해서 한 번 더 찾아본다.
+                    if raw_code in codes_in_batch:
+                        code = raw_code
+                    elif raw_code.zfill(6) in codes_in_batch:
+                        code = raw_code.zfill(6)
+                    elif f"SEC:{raw_code}" in codes_in_batch:
+                        code = f"SEC:{raw_code}"
+                    else:
                         continue  # 환각으로 끼어든 종목은 버린다
                     try:
                         score = float(row.get("score", 0) or 0)
@@ -313,7 +322,7 @@ def fetch_and_store_sentiment(extra_codes: Optional[List[str]] = None) -> dict:
         )
         scores.update(_score_batch(client, batch))
 
-    # 3) 저장 (기존 데이터 전량 교체 — 미국 트랙의 ticker_sentiment_analysis 와 동일 패턴)
+    # 3) 저장 (기존 데이터 전량 교체)
     rows = []
     for item in collected:
         code = item["code"]
@@ -360,3 +369,92 @@ def get_sentiment_map() -> Dict[str, dict]:
     except Exception as e:
         logger.warning(f"감성 점수 조회 실패: {e}")
         return {}
+
+
+# ══════════════════════════════════════════════════════════════════
+# 동적 후보군용 (1단계 스크리닝)
+#   fetch_and_store_sentiment() 는 고정 유니버스(universe.CODE_TO_NAME)를 전제로 한다.
+#   1단계 스크리닝은 시총 상위 200 동적 후보군을 다루므로 고정 리스트 밖 종목이 절반쯤
+#   된다. 그래서 이름을 인자로 받아 같은 채점기를 재사용하는 진입점을 따로 둔다.
+#   결과를 DB 에 저장하지 않는 것도 의도적이다 — kr_ticker_sentiment_analysis 는
+#   ML/점수 파이프라인이 읽는 테이블이라 후보군이 다른 데이터를 섞으면 안 된다.
+# ══════════════════════════════════════════════════════════════════
+
+def score_items(items: List[dict], with_blog: bool = True) -> Dict[str, dict]:
+    """
+    임의의 종목 목록을 감성 채점한다. DB 에 쓰지 않는다.
+
+    items: [{"code", "name"}]
+    Returns: {code: {"score", "relevant_count", "summary", "article_count", "blog_buzz"}}
+    """
+    if not items:
+        return {}
+    if not naver_service.is_configured():
+        logger.warning("  NAVER API 미설정 — 감성 분석을 건너뜁니다")
+        return {}
+    if not settings.ANTHROPIC_API_KEY:
+        logger.warning("  ANTHROPIC_API_KEY 미설정 — 감성 분석을 건너뜁니다")
+        return {}
+
+    collected = []
+    for it in items:
+        query = universe.news_query_for(it["code"], it.get("name"))
+        try:
+            articles = naver_service.search_recent_news(
+                query, days=settings.KR_SENTIMENT_LOOKBACK_DAYS, display=50
+            )
+        except Exception as e:
+            logger.debug(f"  {it['code']} 뉴스 조회 실패: {e}")
+            articles = []
+        buzz = 0
+        if with_blog:
+            try:
+                buzz = naver_service.search_blog_buzz(
+                    query, days=settings.KR_SENTIMENT_LOOKBACK_DAYS
+                )
+            except Exception:
+                buzz = 0
+        collected.append(
+            {"code": it["code"], "name": it.get("name") or it["code"],
+             "articles": articles, "blog_buzz": buzz}
+        )
+        time.sleep(0.2)
+
+    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    scored: Dict[str, dict] = {}
+    for i in range(0, len(collected), TICKERS_PER_CALL):
+        batch = collected[i : i + TICKERS_PER_CALL]
+        try:
+            scored.update(_score_batch(client, batch))
+        except Exception as e:
+            logger.warning(f"  감성 배치 채점 실패(중립 처리): {e}")
+
+    for item in collected:
+        entry = scored.get(item["code"]) or {}
+        entry.setdefault("score", 0.0)
+        entry["article_count"] = len(item["articles"])
+        entry["blog_buzz"] = item["blog_buzz"]
+        scored[item["code"]] = entry
+    return scored
+
+
+def score_sectors(sectors: List[str]) -> Dict[str, dict]:
+    """
+    섹터(업종) 단위 뉴스 감성.
+
+    네이버 금융 '산업분석'은 공식 API 가 없고 크롤링은 ToS 위반 소지가 있어 쓰지 않는다.
+    대신 **섹터명을 검색어로** 뉴스를 한 번 더 긁어 업황 감성을 만든다. 개별 종목 뉴스는
+    회사 이벤트에 좌우되지만 섹터 뉴스는 업황을 반영하므로, 둘을 같이 보면 '회사는
+    조용한데 업황이 무너지는' 경우를 잡아낼 수 있다.
+
+    Returns: {sector: {"score", "summary", "article_count"}}
+    """
+    targets = [s for s in dict.fromkeys(sectors) if s]
+    if not targets:
+        return {}
+    items = [{"code": f"SEC:{s}", "name": f"{s} 업황"} for s in targets]
+    scored = score_items(items, with_blog=False)
+    return {
+        s: scored.get(f"SEC:{s}", {"score": 0.0})
+        for s in targets
+    }

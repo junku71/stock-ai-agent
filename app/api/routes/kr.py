@@ -3,6 +3,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
 from app.core.config import settings
 from app.services.kr import kr_scoring
+from app.services.kr import kr_screening_service, kr_universe_service
 from app.services.kr import (
     kis_domestic_service as kis,
     kr_market_data_service,
@@ -185,7 +186,7 @@ def buy_candidates():
 
 @router.get("/candidates/sell", summary="매도 후보 조회 (기계적 규칙)")
 def sell_candidates():
-    """ATR 손절 / 부분익절+샹들리에 트레일링 / 기술신호개수 / 공포장 — LLM 과 무관하게 항상 실행."""
+    """ATR 전량 익절/손절 / 기술신호개수 / 공포장 — LLM 과 무관하게 항상 실행 (매도는 언제나 전량)."""
     try:
         return recommend.get_mechanical_sell_candidates()
     except Exception as e:
@@ -308,7 +309,7 @@ def execute_buy(
 
 @router.post("/pipeline/execute-sell", summary="매도 판단 즉시 실행")
 def execute_sell():
-    """기계적 규칙(손절/부분익절+샹들리에/기술신호개수/공포장) + 전날 LLM 매도검토 미집행 판정을 실행."""
+    """기계적 규칙(전량 익절/손절/기술신호개수/공포장) + 전날 LLM 매도검토 미집행 판정을 실행."""
     run_auto_sell_now()
     return {"message": "매도 판단을 백그라운드에서 시작했습니다"}
 
@@ -316,7 +317,7 @@ def execute_sell():
 @router.post("/pipeline/execute-sell-review", summary="보유 종목 LLM 매도검토 즉시 실행")
 def execute_sell_review():
     """
-    HOLD/SELL_ALL/SELL_PARTIAL 판정만 내려 kr_llm_sell_decision_logs 에 저장한다.
+    HOLD/SELL_ALL 판정만 내려 kr_llm_sell_decision_logs 에 저장한다.
     실제 매도 주문은 이후 매도 감시 사이클(/pipeline/execute-sell)에서 집행된다.
     """
     run_sell_review_now()
@@ -381,3 +382,51 @@ def get_price(code: str):
     if result.get("rt_cd") != "0":
         raise HTTPException(status_code=400, detail=result.get("msg1", "현재가 조회 실패"))
     return {"code": resolved, "name": universe.CODE_TO_NAME.get(resolved), **result}
+
+
+# ══════════════════════════════════════════════════════════════════
+# 신규 종목 추천 스크리닝 (0~3단계 파이프라인)
+# ══════════════════════════════════════════════════════════════════
+
+@router.post("/screening/run", summary="신규 종목 추천 — 전체 스크리닝")
+def screening_run():
+    """
+    고정 100종목(universe.py) → 0단계 최소필터(유동성·재무건전성) → 1단계 병렬분석
+    (재무+기술+수급) → 감성 분석 → Feature 통합(z-score, ML 제외) 상위 KR_FEATURE_TOP_N
+    → 2단계 ML Filter(상승확률·정확도) 상위 KR_ML_FILTER_TOP_N → 포트폴리오 규칙(섹터
+    분산) → 3단계 LLM 종합판단(Risk/Market 국면 포함) 매수 추천 + 리밸런싱 제안.
+
+    **분석만 하고 주문은 내지 않는다.** 몇 번을 호출해도 매매에 영향이 없다.
+    퀀트데이터 캐시가 없거나 만료됐으면 첫 다운로드가 추가로 걸린다(보통 수십 초).
+    """
+    return kr_screening_service.run_screening(progress=True)
+
+
+@router.post("/screening/stage1", summary="0~1단계만 — 최소필터 + 병렬분석(재무·기술·수급)")
+def screening_stage1():
+    return kr_screening_service.run_stage1(progress=True)
+
+
+@router.get("/screening/portfolio", summary="포트폴리오 현황 (슬롯·섹터 분포)")
+def screening_portfolio():
+    return kr_screening_service.get_portfolio_state()
+
+
+@router.get("/screening/universe", summary="분석 후보군 (시총 상위) 조회")
+def screening_universe(refresh: bool = Query(False, description="true 면 시가총액을 재조회(8분 소요)")):
+    items = kr_universe_service.get_universe(force_refresh=refresh, progress=True)
+    return {
+        "size": len(items),
+        "cache_age_days": kr_universe_service.cache_age_days(),
+        "items": items,
+    }
+
+
+@router.post("/screening/universe/sync", summary="ML 고정 유니버스 동기화 산출물 생성")
+def screening_universe_sync():
+    """
+    현재 시총 상위 목록으로 universe.py / setup_kr.sql / predict_kr.py 갱신용 조각을
+    파일로 떨군다. **세 파일을 자동으로 덮어쓰지는 않는다** — ML 학습 대상이 바뀌면
+    과거 학습 데이터 컬럼과 어긋나므로 사람이 확인하고 반영해야 한다.
+    """
+    return kr_universe_service.sync_static_universe()

@@ -1,8 +1,8 @@
 """
 한국투자증권 국내주식 API 래퍼.
 
-해외주식(app/services/balance_service.py)과 TR_ID·파라미터 체계가 완전히 다르므로
-별도 모듈로 둔다. 토큰 발급/캐싱은 balance_service.get_access_token 을 그대로 재사용
+국내주식 전용 TR_ID·파라미터 체계를 다룬다. 토큰 발급/캐싱은
+kis_auth_service.get_access_token 을 재사용
 (동일 앱키로 국내/해외 모두 호출 가능).
 
 TR_ID 출처: github.com/koreainvestment/open-trading-api
@@ -32,7 +32,7 @@ import pytz
 import requests
 
 from app.core.config import settings
-from app.services.balance_service import get_access_token, current_account_type  # noqa: F401
+from app.services.kis_auth_service import get_access_token, current_account_type  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

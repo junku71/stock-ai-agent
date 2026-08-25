@@ -3,8 +3,8 @@
 
 매수 검토(kr_llm_review_service.py)와 같은 모델/재시도/Fail-Close 구조를 쓰지만 방향이 다르다:
   - 매수 LLM 은 거부권만 가진다 (BUY → HOLD). 실패 시 매수를 막는 것이 안전한 기본값이다.
-  - 이 매도 LLM 은 HOLD/SELL_ALL/SELL_PARTIAL 을 직접 결정한다. 하지만 손절선/부분익절/
-    샹들리에 트레일링/기술신호개수/공포장 규칙은 이 판단과 무관하게 항상 기계적으로 따로 실행되므로
+  - 이 매도 LLM 은 HOLD/SELL_ALL 을 직접 결정한다 (매도는 언제나 전량이다 — 부분매도는 없다).
+    하지만 ATR 익절/손절선·기술신호개수·공포장 규칙은 이 판단과 무관하게 항상 기계적으로 따로 실행되므로
     (app/services/kr/kr_recommendation_service.py::get_mechanical_sell_candidates), 이 LLM 이
     전부 실패해도 자금은 이미 보호되고 있다. 그래서 Fail-Close 기본값은 "추가 매도 안 함(HOLD)"이다
     — 매수 쪽 Fail-Close("매수 차단")와 방향이 반대인 것은 의도된 설계다.
@@ -98,32 +98,15 @@ def _format_holdings(holdings_context: List[dict], is_intraday: bool = False) ->
             if score is not None
             else f"산출 불가 ({h.get('score_note') or '데이터 부족'})"
         )
-        realized_qty = h.get("realized_partial_qty") or 0
         mech_bits = []
         if h.get("atr"):
             mech_bits.append(f"ATR={h['atr']:,.0f}")
         if h.get("stop_loss_price"):
             mech_bits.append(f"손절가 {h['stop_loss_price']:,.0f}원")
         if h.get("stop_distance_pct") is not None:
-            mech_bits.append(f"활성 손절/트레일링선까지 {h['stop_distance_pct']:+.2f}% 여유")
+            mech_bits.append(f"손절선까지 {h['stop_distance_pct']:+.2f}% 여유")
         if h.get("take_profit_distance_pct") is not None:
-            mech_bits.append(f"1차 익절선까지 {h['take_profit_distance_pct']:+.2f}% 남음")
-        if h.get("partial_exit_done"):
-            original_qty = h.get("quantity", 0) + realized_qty
-            ratio = (realized_qty / original_qty * 100) if original_qty else 0
-            mech_bits.append(
-                f"이미 부분매도 {realized_qty}주(최초 보유 대비 약 {ratio:.0f}%) 완료 → "
-                f"잔량 샹들리에 트레일링 중"
-                + (
-                    f"(현재 스탑 {h['chandelier_stop_price']:,.0f}원)"
-                    if h.get("chandelier_stop_price")
-                    else ""
-                )
-                + " — 추가로 SELL_PARTIAL 을 또 내리면 잔량에서 한 번 더 비중이 줄어듭니다,"
-                " 이미 충분히 축소됐다면 HOLD 를 고려하세요"
-            )
-        else:
-            mech_bits.append("부분익절 전 (익절가 도달 시 기계적으로 일부 매도됩니다)")
+            mech_bits.append(f"익절선까지 {h['take_profit_distance_pct']:+.2f}% 남음")
         mech_str = ", ".join(mech_bits) if mech_bits else "레거시 보유분(ATR 정보 없음)"
 
         trend = h.get("score_trend") or []
@@ -191,22 +174,26 @@ def _build_prompt(holdings_context: List[dict], market: dict, is_intraday: bool 
         hold_or_react_principle = (
             "- 가격이 판단 시점보다 불리한 방향으로 눈에 띄게 더 움직였다면 주저 말고 판정을 "
             "바꾸세요. 반대로 별다른 변화가 없다면(그대로거나 유리하게 움직였다면) 근거 없이 "
-            "판정을 바꾸지 마세요 — 기계적 손절/트레일링이 이미 하방을 지키고 있으니 애매한데 "
+            "판정을 바꾸지 마세요 — 기계적 손절선이 이미 하방을 지키고 있으니 애매한데 "
             "굳이 팔 이유는 없습니다."
         )
     else:
         hold_or_react_principle = (
-            "- 애매하면 HOLD 하세요 — 기계적 손절/트레일링이 이미 하방을 지키고 있으므로 "
+            "- 애매하면 HOLD 하세요 — 기계적 손절선이 이미 하방을 지키고 있으므로 "
             "무리하게 팔 이유가 없습니다."
         )
 
     return f"""당신은 한국 주식시장 경력 20년의 포트폴리오 매니저입니다.
 
 ## 당신의 역할
-아래는 이미 보유 중인 국내 종목입니다. **손절선/부분익절/샹들리에 트레일링과 기존 기술신호개수·
-공포장 자동매도 규칙은 이 판단과 무관하게 별도로 항상 기계적으로 실행됩니다** (이번 사이클에 이미
-매도 주문이 나갔을 수도 있습니다). 당신은 그 위에 추가로, 아래 정성적 근거만 보고 종목별로
-HOLD(계속 보유) / SELL_ALL(전량매도) / SELL_PARTIAL(일부매도) 를 결정하는 팀장입니다.{intraday_note}
+아래는 이미 보유 중인 국내 종목입니다. **ATR 익절/손절선과 기술신호개수·공포장 자동매도 규칙은
+이 판단과 무관하게 별도로 항상 기계적으로 실행됩니다** (이번 사이클에 이미 매도 주문이 나갔을 수도
+있습니다). 당신은 그 위에 추가로, 아래 정성적 근거만 보고 종목별로
+HOLD(계속 보유) / SELL_ALL(전량매도) 를 결정하는 팀장입니다.
+
+**이 시스템에 부분매도는 없습니다.** 팔기로 하면 보유수량 전부를 팝니다. 그러니 "조금 줄이고
+싶다" 는 애매한 상태는 SELL_ALL 이 아니라 HOLD 입니다 — 전량을 정리할 만큼 근거가 분명할 때만
+SELL_ALL 을 내리세요.{intraday_note}
 
 ## 판단 근거로 삼을 것
 - **점수 추이(감쇠)**{stale_tag}: 각 종목마다 "최근 순위/점수 추이"를 며칠치 함께 줍니다. 순위가
@@ -216,13 +203,10 @@ HOLD(계속 보유) / SELL_ALL(전량매도) / SELL_PARTIAL(일부매도) 를 �
   그리고 왜 겹쳤는지(실적 이슈, 업황 등 알고 있는 맥락이 있다면 반영). 단, 이 신호들이 일정 개수
   이상 겹치면 이미 기계적 규칙이 전량매도를 별도로 실행하고 있으므로, 당신의 판단은 주로 "아직
   기계적 문턱에는 못 미치지만 조짐이 보이는" 구간에서 가치가 있습니다.
-- **누적 부분매도 이력**: "기계적 상태"에 이미 몇 % 를 정리했는지 나와 있습니다(실시간 반영).
-  이미 상당히 축소된 종목에 또 SELL_PARTIAL 을 내리면 계속 누적으로 줄어드니, 이미 충분히
-  줄었다면 HOLD 를 우선 고려하세요.
 - **교체매매**{stale_tag}: 보유 슬롯이 가득 찬 상태에서 대기 중인 후보가 이 종목보다 점수가
   뚜렷하게 높다면, 이 종목을 팔아 슬롯을 넘겨줄 가치가 있는지 판단하세요. 슬롯 여유가 있거나
   점수 차가 크지 않다면 교체할 필요 없습니다.
-- **하방 여유**: "기계적 상태"에 활성 손절/트레일링선까지 남은 폭이 나와 있습니다(실시간 반영).
+- **하방 여유**: "기계적 상태"에 손절선까지 남은 폭이 나와 있습니다(실시간 반영).
   여유가 거의 없다면 어차피 곧 기계적으로 정리될 테니 당신이 무리해서 팔 필요는 적고, 여유가
   크다면 기계적 안전망이 당분간 작동하지 않는다는 뜻이라 당신의 판단이 더 중요해집니다.
 
@@ -239,9 +223,8 @@ HOLD(계속 보유) / SELL_ALL(전량매도) / SELL_PARTIAL(일부매도) 를 �
 
 ## 판정 원칙
 {hold_or_react_principle}
-- SELL_ALL/SELL_PARTIAL 은 구체적 근거(점수감쇠 추세, 팩터반전 개수, 교체매매 등)를 명시하세요.
-- SELL_PARTIAL 은 익절은 아직 아니지만 위험 신호가 일부 있어 비중만 줄이고 싶을 때 씁니다
-  (비율은 시스템이 고정값으로 처리하니 당신은 방향만 결정하면 됩니다).
+- SELL_ALL 은 구체적 근거(점수감쇠 추세, 팩터반전 개수, 교체매매 등)를 명시하세요.
+- 판정은 HOLD 아니면 SELL_ALL 둘뿐입니다. 중간값은 없습니다.
 
 ## 응답 형식
 반드시 아래 JSON 만 출력하세요. 다른 텍스트나 코드펜스를 덧붙이지 마세요.
@@ -251,7 +234,7 @@ HOLD(계속 보유) / SELL_ALL(전량매도) / SELL_PARTIAL(일부매도) 를 �
     {{
       "code": "종목코드 6자리",
       "stock_name": "종목명",
-      "decision": "HOLD 또는 SELL_ALL 또는 SELL_PARTIAL",
+      "decision": "HOLD 또는 SELL_ALL",
       "reason": "판정 이유 (1~2문장)"
     }}
   ]
@@ -353,7 +336,7 @@ def review_sell_candidates(
                 for h in holdings_context:
                     d = decision_map.get(h["code"], {})
                     verdict = str(d.get("decision", "HOLD")).upper()
-                    if verdict not in ("HOLD", "SELL_ALL", "SELL_PARTIAL"):
+                    if verdict not in ("HOLD", "SELL_ALL"):
                         verdict = "HOLD"
                     reason = d.get("reason", "LLM 응답에 해당 종목 판정 없음")
                     decisions.append(
@@ -420,5 +403,5 @@ def review_sell_candidates(
     except Exception as e:
         logger.warning(f"  LLM 매도검토 실패 알림 발송 실패: {e}")
 
-    # Fail-Close: 실패해도 SELL 결정을 만들지 않는다. 기계적 손절/트레일링이 이미 자금을 보호한다.
+    # Fail-Close: 실패해도 SELL 결정을 만들지 않는다. 기계적 손절선이 이미 자금을 보호한다.
     return {"decisions": [], "market_analysis": fail_reason}

@@ -10,17 +10,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from app.api.api import api_router
-from app.services.economic_service import update_economic_data_in_background
 from app.core.config import settings
-from app.utils.scheduler import (
-    start_scheduler, stop_scheduler,
-    start_sell_scheduler, stop_sell_scheduler,
-    start_economic_data_scheduler, stop_economic_data_scheduler,
-    start_daily_pipeline_scheduler, stop_daily_pipeline_scheduler,
-)
 from app.utils.kr_scheduler import start_kr_scheduler, stop_kr_scheduler
 from contextlib import asynccontextmanager
-import threading
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,14 +21,10 @@ async def lifespan(app: FastAPI):
     await startup()
     yield
     # Shutdown: 필요한 정리 작업
-    stop_scheduler()  # 매수 스케줄러 종료
-    stop_sell_scheduler()  # 매도 스케줄러 종료
-    stop_economic_data_scheduler()  # 경제 데이터 스케줄러 종료
-    stop_daily_pipeline_scheduler()  # 일일 통합 파이프라인 스케줄러 종료
     if settings.KR_ENABLED:
         stop_kr_scheduler()  # 국내주식(KOSPI 100) 스케줄러 종료
 
-app = FastAPI(title="주식 분석 및 추천 API", lifespan=lifespan)
+app = FastAPI(title="국내주식 자동매매 API", lifespan=lifespan)
 
 # CORS 미들웨어 설정
 app.add_middleware(
@@ -51,24 +40,12 @@ app.include_router(api_router)
 
 @app.get("/")
 def read_root():
-    return {"message": "주식 분석 및 추천 API에 오신 것을 환영합니다"}
+    return {"message": "국내주식(KOSPI 100) 자동매매 API에 오신 것을 환영합니다"}
 
-# APScheduler 대신 직접 실행
+
 async def startup():
-    # 서비스 시작 시 경제 데이터 수집 즉시 실행
-    print("서비스 시작 시 경제 데이터 수집을 즉시 실행합니다...")
-    await update_economic_data_in_background()
-    print("초기 경제 데이터 수집이 완료되었습니다.")
-
-    # 주식 자동매매 스케줄러 시작
-    start_scheduler()
-    start_sell_scheduler()
-
-    # 일일 통합 파이프라인 스케줄러 시작 (매일 KST 21:00)
-    start_daily_pipeline_scheduler()
-
-    # 국내주식(KOSPI 100) 트랙 — KR_ENABLED=true 일 때만 기동.
-    # 미국 트랙과 독립된 schedule 인스턴스를 쓰므로 서로 간섭하지 않는다.
+    # 국내주식(KOSPI 100) 트랙 — KR_ENABLED=false 로 두면 API 만 뜨고 스케줄러는 멈춘다.
+    # 점검·수동 백필처럼 자동매매가 돌면 곤란한 상황에서 쓰는 킬 스위치다.
     if settings.KR_ENABLED:
         print("국내주식(KOSPI 100) 스케줄러를 시작합니다...")
         start_kr_scheduler()

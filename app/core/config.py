@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "주식 분석 API"
-    PROJECT_DESCRIPTION: str = "해외주식 잔고 조회 및 주식 예측 API"
+    PROJECT_NAME: str = "국내주식 자동매매 API"
+    PROJECT_DESCRIPTION: str = "KOSPI 100 종목 분석·추천·자동매매 API"
     PROJECT_VERSION: str = "1.0.0"
 
     # DEBUG 설정 추가
@@ -51,23 +51,14 @@ class Settings(BaseSettings):
     KIS_CANO: str = Field(default="", description="계좌번호 앞 8자리")
     KIS_ACNT_PRDT_CD: str = Field(default="01", description="계좌번호 뒤 2자리")
 
-    # 실적 캘린더(EARNINGS_CALENDAR) 전용 키 — 감성분석 키와 분리하여 일일 호출 한도 충돌 방지
-    ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-    ALPHA_VANTAGE_API_KEY_EARNINGS: str = os.getenv("ALPHA_VANTAGE_API_KEY_EARNINGS", "")
-
-
-    # Finnhub — Alpha Vantage 캘린더에 없는 종목(MU/COST/AVGO 등)의 실적일 보강용 (yfinance 429 대체)
-    FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
+    # Claude (뉴스 감성 스코어링 / LLM 매수·매도 검토 / 분석 리포트 작성)
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-    TR_ID: str = os.getenv("TR_ID")
 
     # Kaggle API (ML 예측 노트북 트리거용)
     # 신형 Access Token (KGAT_*) 우선, 없으면 기존 KAGGLE_KEY (32자리 hex) 사용
     KAGGLE_USERNAME: str = os.getenv("KAGGLE_USERNAME", "")
     KAGGLE_API_TOKEN: str = os.getenv("KAGGLE_API_TOKEN", "")
     KAGGLE_KEY: str = os.getenv("KAGGLE_KEY", "")
-    KAGGLE_KERNEL_SLUG: str = os.getenv("KAGGLE_KERNEL_SLUG", "stock-prediction")
-    KAGGLE_NOTEBOOK_DIR: str = os.getenv("KAGGLE_NOTEBOOK_DIR", "kaggle_notebook")
 
     # Slack 알림 (비어있으면 알림 비활성)
     SLACK_WEBHOOK_URL: str = os.getenv("SLACK_WEBHOOK_URL", "")
@@ -81,38 +72,11 @@ class Settings(BaseSettings):
     SLACK_REPORT_CHANNEL: str = os.getenv("SLACK_REPORT_CHANNEL", "")
 
     # ══════════════════════════════════════════════════════════════
-    # 미국 트랙 포지션 사이징 (app/services/position_sizing.py 공유)
-    # ══════════════════════════════════════════════════════════════
-    US_SLOT_RATIO: float = float(os.getenv("US_SLOT_RATIO", "0.10"))
-
-    # 확신도 가중 배분. 0.0 이면 전 종목 균등(기존 동작), 0.5 면 1위 1.5배·꼴찌 0.5배
-    US_SLOT_TILT: float = float(os.getenv("US_SLOT_TILT", "0.5"))
-    US_SLOT_METHOD: str = os.getenv("US_SLOT_METHOD", "rank")  # rank | score
-    US_MIN_SLOT_RATIO: float = float(os.getenv("US_MIN_SLOT_RATIO", "0.05"))
-    US_MAX_SLOT_RATIO: float = float(os.getenv("US_MAX_SLOT_RATIO", "0.20"))
-    US_MAX_TOTAL_EXPOSURE: float = float(os.getenv("US_MAX_TOTAL_EXPOSURE", "0.80"))
-
-    # 매수 여력의 기준 (inquire-psamount 응답 중 어느 필드를 현금으로 볼지)
-    #   "integrated" — frcr_ord_psbl_amt1 (앱의 "통합" 금액, 원화 자동환전 포함)
-    #                  원화통합증거금 계좌에서 원화까지 끌어 쓰려면 이 값.
-    #   "foreign"    — ovrs_ord_psbl_amt (앱의 "외화" 금액, 보유 외화만)
-    #                  실제 보유 외화만 쓴다. 자동환전을 원치 않거나 모의계좌면 이 쪽.
-    #   ※ 모의투자에서는 integrated 값이 실가용액의 7배 이상으로 나와 주문이 거부된다.
-    #     KIS_USE_MOCK=true 면 코드가 자동으로 foreign 을 쓴다.
-    US_CASH_BASIS: str = os.getenv("US_CASH_BASIS", "integrated")
-
-    # Cross-sectional z-score 점수 시스템 v2 활성화
-    # false: v1 (raw weighted sum) 으로 매수 결정, v2 점수는 로깅만
-    # true:  v2 (z-score) 로 매수 결정
-    # 참조: documents/10_멀티팩터_변별력_개선_기획.md
-    USE_SCORING_V2: bool = os.getenv("USE_SCORING_V2", "false").lower() == "true"
-
-    # ══════════════════════════════════════════════════════════════
     # 국내주식(KOSPI 100) 트랙 설정
-    #   기존 미국 트랙과 병행 운영. KR_ENABLED=false 면 KR 스케줄러 미기동.
+    #   KR_ENABLED=false 면 API 만 뜨고 스케줄러는 기동하지 않는다(점검용 킬 스위치).
     #   참조: documents/20_국내주식_KOSPI30_설계.md
     # ══════════════════════════════════════════════════════════════
-    KR_ENABLED: bool = os.getenv("KR_ENABLED", "false").lower() == "true"
+    KR_ENABLED: bool = os.getenv("KR_ENABLED", "true").lower() == "true"
 
     # true 면 KIS 주문 API 를 호출하지 않고 로그만 남김 (로직 검증용 드라이런)
     KR_DRY_RUN: bool = os.getenv("KR_DRY_RUN", "false").lower() == "true"
@@ -122,12 +86,12 @@ class Settings(BaseSettings):
     #   0 으로 두면 필터를 끈다.
     KR_MIN_ML_ACCURACY: float = float(os.getenv("KR_MIN_ML_ACCURACY", "80"))
 
-    # 예측 상승률 하한 (%)
-    KR_MIN_RISE_PROBABILITY: float = float(os.getenv("KR_MIN_RISE_PROBABILITY", "2"))
+    # 예측 상승률 추가 하한 (%). 기본 규칙은 '양수(>0)' 이고, 이 값을 올리면 더 조인다.
+    KR_MIN_RISE_PROBABILITY: float = float(os.getenv("KR_MIN_RISE_PROBABILITY", "0"))
 
     # 종목당 기준 투자 비중 (총자산 대비) / 동시 보유 최대 종목 수
     KR_SLOT_RATIO: float = float(os.getenv("KR_SLOT_RATIO", "0.10"))
-    KR_MAX_POSITIONS: int = int(os.getenv("KR_MAX_POSITIONS", "8"))
+    KR_MAX_POSITIONS: int = int(os.getenv("KR_MAX_POSITIONS", "10"))
 
     # ── 확신도 가중 배분 (app/services/position_sizing.py) ──
     # 종합점수가 높은 종목에 더 많이 배분한다.
@@ -145,18 +109,75 @@ class Settings(BaseSettings):
     KR_MAX_SLOT_RATIO: float = float(os.getenv("KR_MAX_SLOT_RATIO", "0.20"))
     KR_MAX_TOTAL_EXPOSURE: float = float(os.getenv("KR_MAX_TOTAL_EXPOSURE", "0.80"))
 
+    # ── 분석 후보군 (동적 유니버스) ──
+    #   KIS 종목마스터 + 현재가 시가총액으로 매번 상위 N 종목을 새로 뽑는다.
+    #   universe.py(고정 리스트)는 ML 학습 대상 전용으로 남고, 이 값은 1·2단계 후보군만 정한다.
+    KR_UNIVERSE_SIZE: int = int(os.getenv("KR_UNIVERSE_SIZE", "200"))
+    # 캐시 유효기간(일). 시총 순위는 하루아침에 뒤집히지 않으므로 매번 재조회하지 않는다.
+    #   갱신 1회에 KOSPI 보통주 800여 종목을 조회하므로 모의계좌 기준 8분쯤 걸린다.
+    KR_UNIVERSE_REFRESH_DAYS: float = float(os.getenv("KR_UNIVERSE_REFRESH_DAYS", "7"))
+    KR_UNIVERSE_CACHE_DIR: str = os.getenv("KR_UNIVERSE_CACHE_DIR", "cache/kr")
+    # DART 재무제표 캐시 유효기간(일). 분기보고서가 나올 때만 값이 바뀌므로 길게 잡는다.
+    #   OpenDART 는 일 20,000회 제한이 있어 200종목을 매번 새로 받으면 금방 소진된다.
+    KR_DART_CACHE_DAYS: float = float(os.getenv("KR_DART_CACHE_DAYS", "14"))
+
+    # ── 1단계 퀀트 스크리닝 데이터 (kr_quant_data_service) ──
+    #   ai-stock.co.kr 가 매주 갱신하는 KRX 전종목 퀀트 엑셀 1개를 통째로 받아 재무·
+    #   시총·업종 데이터를 종목별 API 호출 없이 확보한다. 1단계 후보군(고정 100종목,
+    #   universe.py)이 여기서 나오므로 KR_UNIVERSE_SIZE(동적 200)는 1단계에 더 안 쓰인다.
+    KR_QUANT_DATA_SOURCE_URL: str = os.getenv(
+        "KR_QUANT_DATA_SOURCE_URL", "https://www.ai-stock.co.kr/krx-finstate.html"
+    )
+    KR_QUANT_DATA_DIR: str = os.getenv("KR_QUANT_DATA_DIR", "data")
+    # 원본이 주간 갱신이므로 7일 — 그보다 자주 받아봐야 새 파일이 없다.
+    KR_QUANT_CACHE_DAYS: float = float(os.getenv("KR_QUANT_CACHE_DAYS", "7"))
+
+    # ── 신규 종목 추천 스크리닝 (kr_screening_service) ──
+    # 1단계 Feature 통합(kr_scoring.compute_scores, ML 제외 — 재무+기술+수급+감성만) 이후
+    # composite_score 상위 몇 종목까지 2단계 ML Filter 로 넘길지.
+    KR_FEATURE_TOP_N: int = int(os.getenv("KR_FEATURE_TOP_N", "30"))
+    # 2단계 ML Filter(상승확률·정확도) 통과 후 3단계 LLM 에게 넘길 최대 후보 수.
+    KR_ML_FILTER_TOP_N: int = int(os.getenv("KR_ML_FILTER_TOP_N", "10"))
+    # 포트폴리오 규칙(_apply_portfolio_rules, 슬롯·섹터 필터) 통과 후 3단계로 넘기는 상한.
+    #   ML Filter 결과(KR_ML_FILTER_TOP_N)를 LLM 이 그대로 다 보게 하려고 같은 값으로 맞춘다
+    #   — 여기서 미리 잘라버리면 LLM 이 "Risk/Market 감안해 3종목 이하로 종합판단"할 재료가
+    #   줄어든다.
+    KR_STAGE2_TOP_N: int = int(os.getenv("KR_STAGE2_TOP_N", "10"))
+    # 3단계 LLM 이 그 후보들 중 실제로 매수 추천할 수 있는 최대 종목 수.
+    KR_LLM_MAX_PICKS: int = int(os.getenv("KR_LLM_MAX_PICKS", "3"))
+    # 리밸런싱 제안이 지켜야 할 보유 종목수 상한.
+    #   KR_MAX_POSITIONS(하드 상한)보다 낮게 잡는다 — 여유 슬롯을 남겨두면 다음 회차에
+    #   더 좋은 후보가 나왔을 때 기존 종목을 억지로 팔지 않고도 담을 수 있다.
+    KR_REBALANCE_MAX_POSITIONS: int = int(os.getenv("KR_REBALANCE_MAX_POSITIONS", "8"))
+    # 같은 섹터에 보유할 수 있는 최대 종목 수 (보유분 포함). '최대한 다양한 섹터' 규칙.
+    KR_MAX_PER_SECTOR: int = int(os.getenv("KR_MAX_PER_SECTOR", "2"))
+    # 3단계 리밸런싱 판단 모델
+    KR_REBALANCE_MODEL: str = os.getenv("KR_REBALANCE_MODEL", "claude-sonnet-5")
+
+    # 1단계 기본적 분석 판정 모델
+    KR_FUNDAMENTAL_MODEL: str = os.getenv("KR_FUNDAMENTAL_MODEL", "claude-sonnet-5")
+    # 1단계 감성 하한. 이 값 이하면 탈락 (-1 ~ +1 척도)
+    KR_SENTIMENT_MIN_SCORE: float = float(os.getenv("KR_SENTIMENT_MIN_SCORE", "-0.1"))
+
+    # 2단계 기술적 분석 — 매수 신호 최소 개수
+    KR_MIN_BUY_SIGNALS: int = int(os.getenv("KR_MIN_BUY_SIGNALS", "2"))
+    # 골든/데드크로스를 '최근'으로 인정할 기간(일)
+    KR_CROSS_LOOKBACK_DAYS: int = int(os.getenv("KR_CROSS_LOOKBACK_DAYS", "10"))
+    # 거래량 급증 판정 배수 (5일 평균 대비)
+    KR_VOLUME_SURGE_RATIO: float = float(os.getenv("KR_VOLUME_SURGE_RATIO", "1.5"))
+
+    # 2단계 수급 — 최근 N 거래일 안에서 M 일 연속 순매수(외국인·기관 각각)
+    KR_FLOW_WINDOW_DAYS: int = int(os.getenv("KR_FLOW_WINDOW_DAYS", "5"))
+    KR_FLOW_STREAK_DAYS: int = int(os.getenv("KR_FLOW_STREAK_DAYS", "3"))
+
     # 시장 데이터 수집 기간 (년). 백필 시작일 = 오늘 - 이 값.
     #   종목이 100개라 기간이 길수록 수집·학습 시간이 선형으로 늘어난다.
     #   5년이면 코로나 이후 국면 + 금리 인상/인하 사이클을 포함한다.
     KR_HISTORY_YEARS: int = int(os.getenv("KR_HISTORY_YEARS", "5"))
 
-    # ── 매도 전략: 부분익절 + 샹들리에 트레일링 + 교체매매 ──
-    # 2.5×ATR 익절가 도달 시 전량매도 대신 일부만 팔고, 잔량은 진입 시점 ATR 로 고정한
-    # 샹들리에(고점 대비 배수) 트레일링 스탑으로 넘긴다. 손절/기존 기술신호·공포장 규칙은 그대로 유지.
-    KR_CHANDELIER_ATR_MULT: float = float(os.getenv("KR_CHANDELIER_ATR_MULT", "3.0"))
-    KR_PARTIAL_SELL_RATIO: float = float(os.getenv("KR_PARTIAL_SELL_RATIO", "0.3"))
-    # 부분익절 수량이 이 값 미만이면 부분매도 대신 전량매도로 대체 (소량 잔량 방지)
-    KR_MIN_PARTIAL_SHARES: int = int(os.getenv("KR_MIN_PARTIAL_SHARES", "1"))
+    # ── 매도 전략 ──
+    # 매도는 언제나 **전량**이다 — 2.5×ATR 익절가 도달 시 전량 익절, 1.5×ATR 손절가 도달 시
+    # 전량 손절. 부분매도/트레일링 잔량 보유는 하지 않는다.
     # 교체매매: 대기 중인 미보유 후보 점수가 가장 약한 보유종목 점수보다 이 값 이상 높고
     # 보유종목수가 KR_MAX_POSITIONS 에 도달했을 때만 LLM 매도검토에 교체후보로 표시한다.
     KR_ROTATION_MIN_SCORE_GAP: float = float(os.getenv("KR_ROTATION_MIN_SCORE_GAP", "0.30"))
@@ -192,7 +213,7 @@ class Settings(BaseSettings):
     #   파이프라인 결과(시장환경·후보·LLM 판단·매수 견적)를 Claude 가 리포트로 정리해
     #   PDF 로 만들어 Slack 채널에 올린다. 실패해도 파이프라인 결과에는 영향이 없다.
     KR_REPORT_ENABLED: bool = os.getenv("KR_REPORT_ENABLED", "true").lower() == "true"
-    KR_REPORT_MODEL: str = os.getenv("KR_REPORT_MODEL", "claude-opus-5")
+    KR_REPORT_MODEL: str = os.getenv("KR_REPORT_MODEL", "claude-sonnet-5")
     # 리포트 PDF 저장 경로 (프로젝트 루트 기준 상대경로 허용)
     KR_REPORT_DIR: str = os.getenv("KR_REPORT_DIR", "reports/kr")
     # 이 일수보다 오래된 리포트 PDF 는 생성 시 자동 정리. 0 이면 정리하지 않음.
@@ -219,7 +240,7 @@ class Settings(BaseSettings):
 
     # 뉴스 감성 스코어링 모델 (기사 텍스트 → -1~+1 점수)
     #   네이버 검색 API 는 AlphaVantage 와 달리 감성 점수를 주지 않으므로 직접 산출한다.
-    KR_SENTIMENT_MODEL: str = os.getenv("KR_SENTIMENT_MODEL", "claude-opus-5")
+    KR_SENTIMENT_MODEL: str = os.getenv("KR_SENTIMENT_MODEL", "claude-sonnet-5")
     KR_SENTIMENT_LOOKBACK_DAYS: int = int(os.getenv("KR_SENTIMENT_LOOKBACK_DAYS", "3"))
 
     # KRX Open API (openapi.krx.co.kr) — 시장 전체 시세/지수. 없으면 해당 수집만 스킵.
@@ -231,7 +252,7 @@ class Settings(BaseSettings):
     # OpenDART — 공시/재무제표 (실적 리스크 판단 보강용, 선택)
     DART_API_KEY: str = os.getenv("DART_API_KEY", "")
 
-    # KR ML 예측 전용 Kaggle 커널 (미국 커널과 분리)
+    # ML 예측 Kaggle 커널
     KAGGLE_KERNEL_SLUG_KR: str = os.getenv("KAGGLE_KERNEL_SLUG_KR", "stock-prediction-kr")
     KAGGLE_NOTEBOOK_DIR_KR: str = os.getenv("KAGGLE_NOTEBOOK_DIR_KR", "kaggle_notebook_kr")
 

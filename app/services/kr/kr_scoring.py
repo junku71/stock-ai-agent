@@ -1,8 +1,8 @@
 """
 국내주식 매수 후보 점수 산출.
 
-미국 트랙(app/services/scoring_service.py)의 cross-sectional z-score 방식을 그대로
-쓰되, 한국 시장 특유의 팩터를 하나 추가한다.
+공용 모듈(app/services/scoring_service.py)의 cross-sectional z-score 위에
+한국 시장 특유의 팩터를 하나 얹는다.
 
   + 수급(flow): 외국인·기관 순매수. 한국 시장에서 가장 검증된 단기 신호로,
     개인 대비 정보 우위가 크고 코스피 대형주는 외국인 수급에 강하게 연동된다.
@@ -12,7 +12,7 @@
     고점 신호로 작동하는 경우가 많아 부호가 불안정하다. 점수에서는 빼고
     LLM 최종 검토에 참고 정보로만 넘긴다.
 
-공포 게이트는 미국의 VIX 대신 코스피 20일 실현변동성(연율%)을 쓴다.
+공포 게이트는 VIX 대신 코스피 20일 실현변동성(연율%)을 쓴다.
 
 2006~2026 실측 분포:
     중위 15.0% / 75%ile 20.4% / 90%ile 29.7% / 95%ile 41.7% / 99%ile 75.6%
@@ -24,16 +24,21 @@
 """
 from typing import List, Optional
 
-# z-score 정규화와 사전 필터는 미국 트랙과 완전히 동일하므로 재사용한다
+# z-score 정규화와 사전 필터는 시장 무관이라 공용 모듈을 재사용한다
 from app.services.scoring_service import apply_prefilters, cross_sectional_zscore
 
 # ── 가중치 (z-score 기준이라 명목 = 실효 영향력) ──────────────────
-W_RISE = 0.18   # ML 예측 상승률 — 보수적
-W_TECH = 0.27   # 기술적 모멘텀 (MACD diff + SMA diff + RSI 평균)
-W_FLOW = 0.15   # 외국인·기관 순매수 ★ 국내 전용
-W_VOL = 0.15    # 거래량 비율 (가격-거래량 컨펌)
-W_ADX = 0.15    # 추세 강도
-W_SENT = 0.10   # 뉴스 감성 (학술 IC 가 약해 낮게)
+# W_FUND 추가(신규종목 추천 파이프라인의 재무 LLM 판정용) 하면서 기존 6개를 0.8배로
+# 축소해 합을 다시 1.00 에 맞췄다 — 서로간 상대 서열은 그대로 유지된다.
+W_FUND = 0.20   # 재무 LLM 판정 점수 — 신규종목 추천(kr_screening_service) 전용,
+                #   일간 파이프라인(kr_recommendation_service)엔 fundamental_score 가 없어
+                #   z-score 가 중립(0)으로 빠지므로 그쪽 동작엔 영향 없다.
+W_RISE = 0.14   # ML 예측 상승률 — 보수적
+W_TECH = 0.22   # 기술적 모멘텀 (MACD diff + SMA diff + RSI 평균)
+W_FLOW = 0.12   # 외국인·기관 순매수 ★ 국내 전용
+W_VOL = 0.12    # 거래량 비율 (가격-거래량 컨펌)
+W_ADX = 0.12    # 추세 강도
+W_SENT = 0.08   # 뉴스 감성 (학술 IC 가 약해 낮게)
 
 BASE_THRESHOLD = 0.40
 
@@ -73,10 +78,18 @@ def get_threshold(fear_index: Optional[float]) -> float:
     return BASE_THRESHOLD + 0.70
 
 
-def compute_scores(candidates: List[dict], fear_index: Optional[float]) -> None:
+def compute_scores(
+    candidates: List[dict], fear_index: Optional[float], include_rise: bool = True
+) -> None:
     """
     후보 리스트 전체를 cross-sectional 로 채점 (in-place).
     각 candidate 에 composite_score, kr_factors, fear_index, scoring_version 을 추가한다.
+
+    include_rise=False 면 ML 예측 상승률(z_rise)을 composite_score 계산에서 뺀다
+    (kr_factors 에는 그대로 채워서 보여준다) — 신규종목 추천 파이프라인이 "Feature 통합
+    (재무+기술+수급+감성)으로 먼저 추리고, 그 다음에 별도의 ML Filter 단계에서 상승확률/
+    정확도로 다시 거른다"는 순서를 쓰기 때문이다. 일간 파이프라인은 기본값(True)이라
+    동작이 그대로 유지된다.
     """
     n = len(candidates)
     if n == 0:
@@ -98,6 +111,9 @@ def compute_scores(candidates: List[dict], fear_index: Optional[float]) -> None:
     # 순매수 대금을 시가총액이 아닌 거래대금 대비 비율로 넣으면 대형주 편향이 줄지만,
     # 무료 소스로 일별 시총을 안정적으로 얻기 어려워 순매수 강도(원)를 그대로 z-score 화한다.
     flow_raw = [c.get("net_buy_score") for c in candidates]
+    # 재무 LLM 판정 점수(0~100) — 신규종목 추천 파이프라인만 채워서 넘긴다. 없는 후보는
+    # None → cross_sectional_zscore 가 중립(0)으로 처리하므로 기존 일간 파이프라인은 무영향.
+    fund_raw = [c.get("fundamental_score") for c in candidates]
 
     z_rise = cross_sectional_zscore(rise_raw)
     z_rsi = cross_sectional_zscore(rsi_raw)
@@ -107,12 +123,14 @@ def compute_scores(candidates: List[dict], fear_index: Optional[float]) -> None:
     z_vol = cross_sectional_zscore(vol_raw)
     z_adx = cross_sectional_zscore(adx_raw)
     z_flow = cross_sectional_zscore(flow_raw)
+    z_fund = cross_sectional_zscore(fund_raw)
 
     z_tech = [(z_macd[i] + z_sma[i] + z_rsi[i]) / 3.0 for i in range(n)]
 
     for i, c in enumerate(candidates):
         composite = (
-            W_RISE * z_rise[i]
+            W_FUND * z_fund[i]
+            + (W_RISE * z_rise[i] if include_rise else 0.0)
             + W_TECH * z_tech[i]
             + W_FLOW * z_flow[i]
             + W_VOL * z_vol[i]
@@ -121,6 +139,7 @@ def compute_scores(candidates: List[dict], fear_index: Optional[float]) -> None:
         )
         c["composite_score"] = round(composite, 4)
         c["kr_factors"] = {
+            "z_fund": round(z_fund[i], 3),
             "z_rise": round(z_rise[i], 3),
             "z_tech": round(z_tech[i], 3),
             "z_macd": round(z_macd[i], 3),
@@ -132,7 +151,7 @@ def compute_scores(candidates: List[dict], fear_index: Optional[float]) -> None:
             "z_sent": round(z_sent[i], 3),
         }
         c["fear_index"] = fear_index
-        c["scoring_version"] = "kr-v1"
+        c["scoring_version"] = "kr-v2"
 
 
 def score_and_filter(
@@ -141,7 +160,7 @@ def score_and_filter(
     """
     사전 필터 → 채점 → 임계값 통과분만 composite_score 내림차순 반환.
 
-    사전 필터는 미국 트랙과 공유한다 (RSI>80 하드블록 + 기술 신호 2개 이상).
+    사전 필터는 공용 모듈에 있다 (RSI>80 하드블록 + 기술 신호 2개 이상).
     """
     passed = [c for c in candidates if apply_prefilters(c)]
     if not passed:
